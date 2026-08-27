@@ -16,8 +16,76 @@ app.use(express.json({ limit: '1mb' }));
 const tokenFor = (id: string) => jwt.sign({ sub: id }, config.jwtSecret, { expiresIn: '7d' });
 const first = async (sql: string, values: unknown[] = []) => (await db.query(sql, values)).rows[0];
 
+const ONBOARDING_STATUSES = ['pending', 'in_progress', 'completed'] as const;
+const ACCESSIBLE_SUBSCRIPTION_STATUSES = new Set(['trial', 'active']);
+
+async function expireSubscriptions(partnerId: string) {
+  await db.query(
+    `UPDATE subscriptions
+     SET status = 'expired', updated_at = NOW()
+     WHERE partner_id = $1
+       AND status IN ('trial', 'active', 'past_due')
+       AND expiry_date IS NOT NULL
+       AND expiry_date <= NOW()`,
+    [partnerId],
+  );
+}
+
+function subscriptionSummary(subscription: any) {
+  if (!subscription) return null;
+  const expiryDate = subscription.expiry_date ? new Date(subscription.expiry_date) : null;
+  const daysRemaining = expiryDate
+    ? Math.max(0, Math.ceil((expiryDate.getTime() - Date.now()) / 86_400_000))
+    : null;
+  return {
+    id: subscription.id,
+    currentPlan: subscription.plan_name || subscription.plan || null,
+    subscriptionStatus: subscription.status,
+    startDate: subscription.start_date,
+    expiryDate: subscription.expiry_date,
+    daysRemaining,
+    autoRenew: subscription.auto_renew,
+    maxUsersPerBranch: subscription.max_users ?? null,
+    maxBranches: subscription.max_branches ?? null,
+  };
+}
+
+function onboardingSummary(partner: any, subscription: any) {
+  const status = ONBOARDING_STATUSES.includes(partner?.onboarding_status)
+    ? partner.onboarding_status
+    : partner?.onboarding_completed ? 'completed' : 'pending';
+  return {
+    status,
+    showCompleteOnboarding: status !== 'completed',
+    showMyRestaurant: status === 'completed',
+    restaurantAccessAllowed: status === 'completed' && ACCESSIBLE_SUBSCRIPTION_STATUSES.has(subscription?.status),
+  };
+}
+
 app.get('/health', async (_req, res) => { try { await db.query('SELECT 1'); res.json({ status: 'ok', database: 'postgresql' }); } catch { res.status(503).json({ status: 'error' }); } });
-app.post('/api/auth/register', async (req, res) => { const { owner_name, restaurant_name, email, phone, password } = req.body; if (![owner_name, restaurant_name, email, phone, password].every((v) => typeof v === 'string' && v.trim()) || password.length < 6) return res.status(400).json({ error: 'Valid registration fields are required.' }); try { const id = randomUUID(); const client = await db.connect(); try { await client.query('BEGIN'); await client.query('INSERT INTO users (id,email,password_hash) VALUES ($1,$2,$3)', [id, email.trim().toLowerCase(), await bcrypt.hash(password, 12)]); await client.query('INSERT INTO partners (id,owner_name,restaurant_name,email,phone) VALUES ($1,$2,$3,$4,$5)', [id, owner_name.trim(), restaurant_name.trim(), email.trim().toLowerCase(), phone.trim()]); await client.query('INSERT INTO subscriptions (id,partner_id) VALUES ($1,$2)', [randomUUID(), id]); await client.query('COMMIT'); return res.status(201).json({ token: tokenFor(id), user: { id, email: email.trim().toLowerCase() } }); } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } } catch { return res.status(409).json({ error: 'An account with this email already exists.' }); } });
+app.post('/api/auth/register', async (req, res) => {
+  const { owner_name, restaurant_name, email, phone, password } = req.body;
+  if (![owner_name, restaurant_name, email, phone, password].every((value) => typeof value === 'string' && value.trim()) || password.length < 6) {
+    return res.status(400).json({ error: 'Valid registration fields are required.' });
+  }
+  try {
+    const id = randomUUID();
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const trialPlan = (await client.query("SELECT * FROM subscription_plans WHERE name='Free Trial' AND is_active=TRUE")).rows[0];
+      if (!trialPlan) throw new Error('Free Trial plan is not configured.');
+      const startDate = new Date();
+      const expiryDate = new Date(startDate);
+      expiryDate.setDate(expiryDate.getDate() + Number(trialPlan.trial_days || 14));
+      await client.query('INSERT INTO users (id,email,password_hash) VALUES ($1,$2,$3)', [id, email.trim().toLowerCase(), await bcrypt.hash(password, 12)]);
+      await client.query('INSERT INTO partners (id,owner_name,restaurant_name,email,phone,onboarding_status,onboarding_completed) VALUES ($1,$2,$3,$4,$5,$6,FALSE)', [id, owner_name.trim(), restaurant_name.trim(), email.trim().toLowerCase(), phone.trim(), 'pending']);
+      await client.query('INSERT INTO subscriptions (id,partner_id,plan_id,plan,billing_cycle,status,start_date,expiry_date,auto_renew,amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9)', [randomUUID(), id, trialPlan.id, 'free trial', trialPlan.billing_cycle, 'trial', startDate, expiryDate, trialPlan.price]);
+      await client.query('COMMIT');
+      return res.status(201).json({ token: tokenFor(id), user: { id, email: email.trim().toLowerCase() } });
+    } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+  } catch { return res.status(409).json({ error: 'An account with this email already exists.' }); }
+});
 app.post('/api/auth/login', async (req, res) => { const user = await first('SELECT id,email,password_hash FROM users WHERE email=$1', [String(req.body.email || '').trim().toLowerCase()]); if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.password_hash))) return res.status(401).json({ error: 'Invalid email or password.' }); return res.json({ token: tokenFor(user.id), user: { id: user.id, email: user.email } }); });
 app.post('/api/demo-requests', async (req, res) => { const parsed = demoRequestSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: 'Invalid demo request.' }); const ref = referenceId('DMO'); const d = parsed.data; const request = await first('INSERT INTO demo_requests (id,name,restaurant_name,email,phone,city,number_of_branches,preferred_date,preferred_time,message,reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [randomUUID(), d.name,d.restaurant_name,d.email,d.phone,d.city,d.number_of_branches,d.preferred_date,d.preferred_time,d.message,ref]); return res.status(201).json({ request, reference_id: ref }); });
 app.post('/api/contact-queries', async (req, res) => { const { name,email,phone,subject,message } = req.body; if (![name,email,phone,subject,message].every((v) => typeof v === 'string' && v.trim())) return res.status(400).json({ error: 'All contact fields are required.' }); const query = await first('INSERT INTO contact_queries (id,name,email,phone,subject,message,reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [randomUUID(),name,email,phone,subject,message,referenceId('QRY')]); return res.status(201).json({ query }); });

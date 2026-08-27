@@ -21,13 +21,27 @@ export async function initDatabase() {
   await db.query(`
     ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES subscription_plans(id);
     ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS onboarding_status TEXT NOT NULL DEFAULT 'pending';
+    UPDATE partners
+    SET onboarding_status = CASE WHEN onboarding_completed THEN 'completed' ELSE 'pending' END
+    WHERE onboarding_status IS NULL OR onboarding_status NOT IN ('pending', 'in_progress', 'completed');
+    DO $$ BEGIN
+      ALTER TABLE partners ADD CONSTRAINT partners_onboarding_status_check
+      CHECK (onboarding_status IN ('pending', 'in_progress', 'completed'));
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+    ALTER TABLE subscription_plans ALTER COLUMN max_users DROP NOT NULL;
+    ALTER TABLE subscription_plans ALTER COLUMN max_branches DROP NOT NULL;
     INSERT INTO subscription_plans (name, price, billing_cycle, max_users, max_branches, trial_days, features)
     VALUES
-      ('Free Trial', 0, 'monthly', 1, 1, 14, '["Full feature access", "14-day trial"]'),
-      ('Starter', 499, 'monthly', 2, 1, 0, '["2 Users", "1 Branch"]'),
-      ('Basic', 999, 'monthly', 3, 1, 0, '["3 Users", "1 Branch"]'),
-      ('Pro', 1999, 'monthly', 10, 3, 0, '["10 Users", "3 Branches"]')
-    ON CONFLICT (name) DO NOTHING;
+      ('Free Trial', 0, 'monthly', 2, 2, 14, '["Full feature access", "14-day trial", "2 users per branch", "2 branches"]'),
+      ('Starter', 499, 'monthly', 3, 3, 0, '["3 users per branch", "3 branches"]'),
+      ('Basic', 999, 'monthly', 5, 5, 0, '["5 users per branch", "5 branches"]'),
+      ('Pro', 1999, 'monthly', NULL, NULL, 0, '["Unlimited users per branch", "Unlimited branches"]')
+    ON CONFLICT (name) DO UPDATE SET
+      price = EXCLUDED.price, billing_cycle = EXCLUDED.billing_cycle,
+      max_users = EXCLUDED.max_users, max_branches = EXCLUDED.max_branches,
+      trial_days = EXCLUDED.trial_days, features = EXCLUDED.features, is_active = TRUE;
     UPDATE subscriptions s
     SET plan_id = p.id
     FROM subscription_plans p
