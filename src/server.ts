@@ -54,7 +54,7 @@ const subscriptionResponse = (subscription: any) => {
 
 app.get('/api/subscriptions/plans', async (_req, res) => {
   try {
-    const plans = await db.query('SELECT id,name,price,billing_cycle,max_users,max_branches,trial_days,features FROM subscription_plans WHERE is_active=TRUE ORDER BY price ASC');
+    const plans = await db.query('SELECT id,name,price,billing_cycle,max_users,max_branches,trial_days,features,is_active FROM subscription_plans WHERE is_active=TRUE ORDER BY price ASC');
     res.json({ success: true, plans: plans.rows });
   } catch {
     res.status(500).json({ success: false, message: 'Failed to fetch subscription plans' });
@@ -270,7 +270,7 @@ app.post('/api/onboarding/complete', async (req: AuthenticatedRequest, res) => {
 });
 app.get('/api/dashboard', async (req: AuthenticatedRequest,res) => { const id=req.userId; const [partner,subscription,invoices,tickets,notifications]=await Promise.all([first('SELECT * FROM partners WHERE id=$1',[id]),first('SELECT * FROM subscriptions WHERE partner_id=$1',[id]),db.query('SELECT * FROM invoices WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id]),db.query('SELECT * FROM support_tickets WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id]),db.query('SELECT * FROM notifications WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id])]); res.json({partner,subscription,invoices:invoices.rows,tickets:tickets.rows,notifications:notifications.rows}); });
 app.get('/api/subscription',async(req:AuthenticatedRequest,res)=>res.json({subscription:await first('SELECT * FROM subscriptions WHERE partner_id=$1',[req.userId])}));
-app.patch('/api/subscription',async(req:AuthenticatedRequest,res)=>{const allowed=['plan','billing_cycle','status','auto_renew','amount','start_date','expiry_date']; for(const [key,value] of Object.entries(req.body).filter(([k])=>allowed.includes(k))) await db.query(`UPDATE subscriptions SET ${key}=$1 WHERE partner_id=$2`,[value,req.userId]); res.json({subscription:await first('SELECT * FROM subscriptions WHERE partner_id=$1',[req.userId])});});
+app.patch('/api/subscription',async(req:AuthenticatedRequest,res)=>{const allowed=['plan_id','plan','billing_cycle','status','auto_renew','amount','start_date','expiry_date']; for(const [key,value] of Object.entries(req.body).filter(([k])=>allowed.includes(k))) await db.query(`UPDATE subscriptions SET ${key}=$1,updated_at=NOW() WHERE partner_id=$2`,[value,req.userId]); res.json({subscription:await first('SELECT * FROM subscriptions WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 1',[req.userId])});});
 app.get('/api/invoices',async(req:AuthenticatedRequest,res)=>res.json({invoices:(await db.query('SELECT * FROM invoices WHERE partner_id=$1 ORDER BY created_at DESC',[req.userId])).rows}));
 app.get('/api/notifications',async(req:AuthenticatedRequest,res)=>res.json({notifications:(await db.query('SELECT * FROM notifications WHERE partner_id=$1 ORDER BY created_at DESC',[req.userId])).rows}));
 app.patch('/api/notifications/:id/read',async(req:AuthenticatedRequest,res)=>{await db.query('UPDATE notifications SET is_read=TRUE WHERE id=$1 AND partner_id=$2',[req.params.id,req.userId]);res.json({ok:true});});
