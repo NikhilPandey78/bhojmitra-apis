@@ -1,8 +1,8 @@
 import type { NextFunction, Response } from 'express';
-import type { AuthenticatedRequest } from '../types';
+import type { AuthenticatedRequest } from '../types.js';
 import jwt from 'jsonwebtoken';
-import { config } from '../config';
-import { db } from '../db';
+import { config } from '../config.js';
+import { db } from '../db.js';
 
 export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
