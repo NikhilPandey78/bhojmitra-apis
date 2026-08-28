@@ -416,6 +416,22 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
      * activated after successful Razorpay verification.
      */
     if (action === 'initial') {
+      /*
+       * INITIAL payment is only allowed when there is no active
+       * paid subscription. Never convert an active subscription
+       * into pending because of an initial-payment request.
+       */
+      if (
+        existingSubscription &&
+        ['active', 'trial'].includes(
+          String(existingSubscription.status).toLowerCase(),
+        )
+      ) {
+        return res.status(400).json({
+          error: 'An existing subscription is already active.',
+        });
+      }
+
       if (existingSubscription) {
         await db.query(
           `UPDATE subscriptions
@@ -1158,7 +1174,7 @@ app.post('/api/subscriptions/start-trial', async (req: AuthenticatedRequest, res
     expiryDate.setDate(expiryDate.getDate() + 14);
 
     const existingSubscriptionResult = await client.query(
-      `SELECT id
+      `SELECT id, status, plan_id, plan, amount, expiry_date
        FROM subscriptions
        WHERE partner_id = $1
        ORDER BY created_at DESC
@@ -1169,6 +1185,22 @@ app.post('/api/subscriptions/start-trial', async (req: AuthenticatedRequest, res
 
     const existingSubscription =
       existingSubscriptionResult.rows[0];
+
+    /*
+     * Never overwrite an active paid subscription with Free Trial.
+     */
+    if (
+      existingSubscription &&
+      String(existingSubscription.status).toLowerCase() === 'active'
+    ) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        success: false,
+        code: 'ACTIVE_SUBSCRIPTION_EXISTS',
+        message: 'An active subscription already exists.',
+      });
+    }
 
     let subscription;
 
