@@ -2,7 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac } from 'node:crypto';
+import Razorpay from 'razorpay';
 import { config } from './config.js';
 import { db, initDatabase } from './db.js';
 import { requireAuth, requireCompletedOnboarding } from './middleware/auth.js';
@@ -15,6 +16,11 @@ app.use(cors({ origin: config.corsOrigin }));
 app.use(express.json({ limit: '1mb' }));
 const tokenFor = (id: string) => jwt.sign({ sub: id }, config.jwtSecret, { expiresIn: '7d' });
 const first = async (sql: string, values: unknown[] = []) => (await db.query(sql, values)).rows[0];
+
+const razorpay = new Razorpay({
+  key_id: config.razorpayKeyId,
+  key_secret: config.razorpayKeySecret,
+});
 
 const ONBOARDING_STATUSES = ['pending', 'in_progress', 'completed'] as const;
 const ACCESSIBLE_SUBSCRIPTION_STATUSES = new Set(['trial', 'active']);
@@ -139,23 +145,11 @@ app.get('/api/subscriptions/current', async (req: AuthenticatedRequest, res) => 
   }
 });
 
-app.post('/api/subscriptions', async (req: AuthenticatedRequest, res) => {
-  try {
-    const planId = Number(req.body.planId);
-    if (!Number.isInteger(planId)) return res.status(400).json({ success: false, message: 'planId is required' });
-    const plan = await first('SELECT * FROM subscription_plans WHERE id=$1 AND is_active=TRUE', [planId]);
-    if (!plan) return res.status(404).json({ success: false, message: 'Subscription plan not found' });
-    const existing = await first("SELECT id FROM subscriptions WHERE partner_id=$1 AND status='active'", [req.userId]);
-    if (existing) return res.status(409).json({ success: false, message: 'User already has an active subscription' });
-    const startDate = new Date();
-    const expiryDate = new Date(startDate);
-    if (plan.trial_days > 0) expiryDate.setDate(expiryDate.getDate() + plan.trial_days);
-    else expiryDate.setMonth(expiryDate.getMonth() + 1);
-    const subscription = await first('INSERT INTO subscriptions (id,partner_id,plan_id,plan,billing_cycle,status,start_date,expiry_date,auto_renew,amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9) RETURNING *', [randomUUID(), req.userId, plan.id, String(plan.name).toLowerCase(), plan.billing_cycle, 'active', startDate, expiryDate, plan.price]);
-    res.status(201).json({ success: true, message: 'Subscription created successfully', subscription });
-  } catch {
-    res.status(500).json({ success: false, message: 'Failed to create subscription' });
-  }
+app.post('/api/subscriptions', async (_req: AuthenticatedRequest, res) => {
+  return res.status(403).json({
+    success: false,
+    message: 'Subscriptions must be created through the payment flow.',
+  });
 });
 
 async function changePlan(req: AuthenticatedRequest, res: express.Response, direction: 'upgrade' | 'downgrade') {
@@ -224,14 +218,400 @@ app.get('/api/me', async (req: AuthenticatedRequest, res) => {
       [req.userId]
     );
 
+    if (req.userId) await expireSubscriptions(req.userId);
+
+    const latestSubscription = await first(
+      `SELECT s.*, p.name AS plan_name, p.max_users, p.max_branches, p.features
+       FROM subscriptions s
+       JOIN subscription_plans p ON p.id = s.plan_id
+       WHERE s.partner_id=$1
+       ORDER BY s.created_at DESC
+       LIMIT 1`,
+      [req.userId]
+    );
+
+    const onboarding = onboardingSummary(partner, latestSubscription);
+    const subscriptionInfo = subscriptionSummary(latestSubscription);
+
     return res.json({
       partner,
-      subscription,
+      subscription: latestSubscription,
+      onboarding,
+      subscriptionInfo,
+      access: {
+        showCompleteOnboarding: onboarding.showCompleteOnboarding,
+        showMyRestaurant: onboarding.showMyRestaurant,
+        restaurantAccessAllowed: onboarding.restaurantAccessAllowed,
+      },
     });
   } catch (error) {
     console.error('GET /api/me error:', error);
     return res.status(500).json({
       error: 'Failed to fetch user profile.',
+    });
+  }
+});
+
+
+app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const userId: string = req.userId;
+    const planName = String(req.body?.plan || '').trim().toLowerCase();
+    const billingCycle = String(req.body?.billing_cycle || 'monthly').trim().toLowerCase();
+    const action = String(req.body?.action || 'upgrade').trim().toLowerCase();
+
+    if (!['renew', 'upgrade', 'downgrade'].includes(action)) {
+      return res.status(400).json({ error: 'Invalid payment action.' });
+    }
+
+    if (!planName) {
+      return res.status(400).json({ error: 'Plan is required.' });
+    }
+
+    if (!['monthly', 'yearly'].includes(billingCycle)) {
+      return res.status(400).json({ error: 'Invalid billing cycle.' });
+    }
+
+    const plan = await first(
+      `SELECT id, name, price, billing_cycle, is_active
+       FROM subscription_plans
+       WHERE LOWER(name) = $1
+         AND is_active = TRUE
+       LIMIT 1`,
+      [planName],
+    );
+
+    if (!plan) {
+      return res.status(404).json({ error: 'Selected plan is not available.' });
+    }
+
+    if (String(plan.name).toLowerCase() === 'free trial') {
+      return res.status(400).json({
+        error: 'Free Trial does not require payment.',
+      });
+    }
+
+    if (billingCycle !== String(plan.billing_cycle).toLowerCase()) {
+      return res.status(400).json({
+        error: 'Invalid billing cycle for selected plan.',
+      });
+    }
+
+    const amount = Number(plan.price);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        error: 'Invalid plan amount.',
+      });
+    }
+
+    const order = await new Promise<any>((resolve, reject) => {
+      razorpay.orders.create(
+        {
+          amount: Math.round(amount * 100),
+          currency: 'INR',
+          receipt: `sub_${userId}_${Date.now()}`,
+          notes: {
+            partner_id: userId,
+            plan_id: String(plan.id),
+            plan_name: String(plan.name),
+            billing_cycle: billingCycle,
+          },
+        },
+        (error: any, createdOrder: any) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(createdOrder);
+        },
+      );
+    });
+
+    const existingSubscription = await first(
+      `SELECT id, plan_id, plan, billing_cycle, status, amount
+       FROM subscriptions
+       WHERE partner_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId],
+    );
+
+    if (!existingSubscription) {
+      return res.status(404).json({
+        error: 'Subscription record not found.',
+      });
+    }
+
+    if (action === 'upgrade' &&
+        Number(plan.price) <= Number(existingSubscription.amount)) {
+      return res.status(400).json({
+        error: 'Selected plan is not an upgrade.',
+      });
+    }
+
+    if (action === 'downgrade' &&
+        Number(plan.price) >= Number(existingSubscription.amount)) {
+      return res.status(400).json({
+        error: 'Selected plan is not a downgrade.',
+      });
+    }
+
+    if (action === 'renew' &&
+        String(plan.name).toLowerCase() !== String(existingSubscription.plan).toLowerCase()) {
+      return res.status(400).json({
+        error: 'Renewal must use the current plan.',
+      });
+    }
+
+    await db.query(
+      `UPDATE subscriptions
+       SET razorpay_order_id = $1,
+           razorpay_payment_id = NULL,
+           razorpay_signature = NULL,
+           updated_at = NOW()
+       WHERE id = $2
+         AND partner_id = $3`,
+      [
+        order.id,
+        existingSubscription.id,
+        userId,
+      ],
+    );
+
+    return res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: config.razorpayKeyId,
+      plan: plan.name,
+      billingCycle,
+      action,
+    });
+  } catch (error) {
+    console.error('POST /api/payments/create-order error:', error);
+    return res.status(500).json({
+      error: 'Failed to create payment order.',
+    });
+  }
+});
+
+
+app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const userId: string = req.userId;
+
+    const razorpayOrderId = String(req.body?.razorpay_order_id || '').trim();
+    const razorpayPaymentId = String(req.body?.razorpay_payment_id || '').trim();
+    const razorpaySignature = String(req.body?.razorpay_signature || '').trim();
+
+    if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+      return res.status(400).json({
+        error: 'Payment verification details are required.',
+      });
+    }
+
+    const subscription = await first(
+      `SELECT *
+       FROM subscriptions
+       WHERE partner_id = $1
+         AND razorpay_order_id = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId, razorpayOrderId],
+    );
+
+    if (!subscription) {
+      return res.status(404).json({
+        error: 'Payment order was not found.',
+      });
+    }
+
+    const generatedSignature = createHmac(
+      'sha256',
+      config.razorpayKeySecret,
+    )
+      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+      .digest('hex');
+
+    if (generatedSignature !== razorpaySignature) {
+      return res.status(400).json({
+        error: 'Payment verification failed.',
+      });
+    }
+
+    /*
+     * Payment/order information is stored against the subscription.
+     * The subscription action is determined from the order's current
+     * subscription state.
+     */
+    const previousPlan = String(subscription.plan || '').toLowerCase();
+
+    const currentPlan = await first(
+      `SELECT id, name, price, billing_cycle
+       FROM subscription_plans
+       WHERE id = $1
+       LIMIT 1`,
+      [subscription.plan_id],
+    );
+
+    if (!currentPlan) {
+      return res.status(400).json({
+        error: 'Subscription plan could not be verified.',
+      });
+    }
+
+    /*
+     * Prevent duplicate verification.
+     */
+    if (
+      subscription.status === 'active' &&
+      subscription.razorpay_payment_id === razorpayPaymentId
+    ) {
+      return res.json({
+        success: true,
+        message: 'Payment already verified.',
+        subscription: {
+          id: subscription.id,
+          status: subscription.status,
+          plan: previousPlan,
+          expiryDate: subscription.expiry_date,
+        },
+      });
+    }
+
+    /*
+     * The order must still be pending.
+     * This prevents reusing an already processed subscription order.
+     */
+    if (subscription.status !== 'pending') {
+      return res.status(400).json({
+        error: 'This payment order is no longer pending.',
+      });
+    }
+
+    const startDate = new Date();
+
+    /*
+     * Renew an existing active subscription from the frontend flow:
+     * the order was created for the same current plan.
+     *
+     * Upgrade/downgrade orders already changed plan_id/plan/amount
+     * to the selected plan before payment. Therefore successful
+     * verification activates that selected plan.
+     */
+    const expiryDate = new Date(startDate);
+
+    if (subscription.billing_cycle === 'yearly') {
+      expiryDate.setFullYear(expiryDate.getFullYear() + 1);
+    } else {
+      expiryDate.setMonth(expiryDate.getMonth() + 1);
+    }
+
+    const client = await db.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      const updatedSubscription = await client.query(
+        `UPDATE subscriptions
+         SET status = 'active',
+             start_date = $1,
+             expiry_date = $2,
+             razorpay_payment_id = $3,
+             razorpay_signature = $4,
+             updated_at = NOW()
+         WHERE id = $5
+           AND partner_id = $6
+           AND status = 'pending'
+           AND razorpay_order_id = $7
+         RETURNING *`,
+        [
+          startDate,
+          expiryDate,
+          razorpayPaymentId,
+          razorpaySignature,
+          subscription.id,
+          userId,
+          razorpayOrderId,
+        ],
+      );
+
+      if (!updatedSubscription.rows[0]) {
+        throw new Error('Subscription could not be activated.');
+      }
+
+      const activatedSubscription = updatedSubscription.rows[0];
+
+      /*
+       * Create invoice only after successful Razorpay signature
+       * verification and successful subscription activation.
+       */
+      await client.query(
+        `INSERT INTO invoices
+         (id, partner_id, invoice_number, invoice_date, plan, amount, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'paid')`,
+        [
+          randomUUID(),
+          userId,
+          `INV-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`,
+          startDate,
+          String(activatedSubscription.plan),
+          activatedSubscription.amount,
+        ],
+      );
+
+      /*
+       * Payment notification is also created only after successful
+       * payment verification.
+       */
+      await client.query(
+        `INSERT INTO notifications
+         (id, partner_id, type, title, message, is_read)
+         VALUES ($1, $2, $3, $4, $5, FALSE)`,
+        [
+          randomUUID(),
+          userId,
+          'payment',
+          'Payment Successful',
+          `Your ${String(activatedSubscription.plan)} subscription is now active until ${expiryDate.toISOString()}.`,
+        ],
+      );
+
+      await client.query('COMMIT');
+
+      return res.json({
+        success: true,
+        message: 'Payment verified and subscription activated.',
+        subscription: {
+          id: activatedSubscription.id,
+          status: activatedSubscription.status,
+          plan: activatedSubscription.plan,
+          billingCycle: activatedSubscription.billing_cycle,
+          amount: activatedSubscription.amount,
+          startDate: activatedSubscription.start_date,
+          expiryDate: activatedSubscription.expiry_date,
+        },
+      });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('POST /api/payments/verify error:', error);
+
+    return res.status(500).json({
+      error: 'Failed to verify payment.',
     });
   }
 });
@@ -329,7 +709,7 @@ app.post('/api/onboarding/complete', async (req: AuthenticatedRequest, res) => {
   try {
     const subscription = await first('SELECT status FROM subscriptions WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 1', [req.userId]);
     const status = subscription?.status === 'active' ? 'active' : 'trial';
-    const partner = await first('UPDATE partners SET owner_name=$1,phone=$2,restaurant_name=$3,restaurant_type=$4,city=$5,business_name=$6,gst_number=$7,business_type=$8,number_of_branches=$9,status=$10,onboarding_completed=TRUE,updated_at=NOW() WHERE id=$11 RETURNING *', [owner_name.trim(), phone.trim(), restaurant_name.trim(), restaurant_type.trim(), city.trim(), business_name.trim(), gst_number.trim(), business_type.trim(), Number(branch_count), status, req.userId]);
+    const partner = await first("UPDATE partners SET owner_name=$1,phone=$2,restaurant_name=$3,restaurant_type=$4,city=$5,business_name=$6,gst_number=$7,business_type=$8,number_of_branches=$9,status=$10,onboarding_status='completed',onboarding_completed=TRUE,updated_at=NOW() WHERE id=$11 RETURNING *", [owner_name.trim(), phone.trim(), restaurant_name.trim(), restaurant_type.trim(), city.trim(), business_name.trim(), gst_number.trim(), business_type.trim(), Number(branch_count), status, req.userId]);
     if (!partner) return res.status(404).json({ error: 'Restaurant account not found.' });
     return res.json({ partner, onboarding_completed: true });
   } catch {
@@ -338,7 +718,13 @@ app.post('/api/onboarding/complete', async (req: AuthenticatedRequest, res) => {
 });
 app.get('/api/dashboard', async (req: AuthenticatedRequest,res) => { const id=req.userId; const [partner,subscription,invoices,tickets,notifications]=await Promise.all([first('SELECT * FROM partners WHERE id=$1',[id]),first('SELECT * FROM subscriptions WHERE partner_id=$1',[id]),db.query('SELECT * FROM invoices WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id]),db.query('SELECT * FROM support_tickets WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id]),db.query('SELECT * FROM notifications WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id])]); res.json({partner,subscription,invoices:invoices.rows,tickets:tickets.rows,notifications:notifications.rows}); });
 app.get('/api/subscription',async(req:AuthenticatedRequest,res)=>res.json({subscription:await first('SELECT * FROM subscriptions WHERE partner_id=$1',[req.userId])}));
-app.patch('/api/subscription',async(req:AuthenticatedRequest,res)=>{const allowed=['plan_id','plan','billing_cycle','status','auto_renew','amount','start_date','expiry_date']; for(const [key,value] of Object.entries(req.body).filter(([k])=>allowed.includes(k))) await db.query(`UPDATE subscriptions SET ${key}=$1,updated_at=NOW() WHERE partner_id=$2`,[value,req.userId]); res.json({subscription:await first('SELECT * FROM subscriptions WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 1',[req.userId])});});
+app.patch('/api/subscription', async (req: AuthenticatedRequest, res) => {
+  return res.status(403).json({
+    success: false,
+    message: 'Subscription changes must be completed through the payment flow.',
+  });
+});
+
 app.get('/api/invoices',async(req:AuthenticatedRequest,res)=>res.json({invoices:(await db.query('SELECT * FROM invoices WHERE partner_id=$1 ORDER BY created_at DESC',[req.userId])).rows}));
 app.get('/api/notifications',async(req:AuthenticatedRequest,res)=>res.json({notifications:(await db.query('SELECT * FROM notifications WHERE partner_id=$1 ORDER BY created_at DESC',[req.userId])).rows}));
 app.patch('/api/notifications/:id/read',async(req:AuthenticatedRequest,res)=>{await db.query('UPDATE notifications SET is_read=TRUE WHERE id=$1 AND partner_id=$2',[req.params.id,req.userId]);res.json({ok:true});});

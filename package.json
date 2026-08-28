@@ -2,9 +2,9 @@
   "name": "bhojmitra-backend",
   "version": "1.0.0",
   "private": true,
-  "type":"module",
+  "type": "module",
   "scripts": {
-  "dev": "tsx watch src/server.ts",
+    "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts"
   },
   "dependencies": {
@@ -14,14 +14,15 @@
     "express": "^4.21.1",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.1",
+    "razorpay": "^2.9.8",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
-    "@types/jsonwebtoken": "^9.0.7",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
