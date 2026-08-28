@@ -1326,9 +1326,53 @@ app.post('/api/onboarding/complete', async (req: AuthenticatedRequest, res) => {
     return res.status(400).json({ error: 'Complete all required onboarding details before continuing.' });
   }
   try {
-    const subscription = await first('SELECT status FROM subscriptions WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 1', [req.userId]);
+    const subscription = await first(
+      `SELECT
+         s.status,
+         p.name AS plan_name,
+         p.max_branches
+       FROM subscriptions s
+       JOIN subscription_plans p ON p.id = s.plan_id
+       WHERE s.partner_id = $1
+       ORDER BY s.created_at DESC
+       LIMIT 1`,
+      [req.userId],
+    );
+
+    const requestedBranches = Number(branch_count);
+
+    if (
+      subscription?.max_branches !== null &&
+      subscription?.max_branches !== undefined &&
+      requestedBranches > Number(subscription.max_branches)
+    ) {
+      return res.status(400).json({
+        error: 'Branch limit exceeded for your subscription plan.',
+        code: 'MAX_BRANCHES_EXCEEDED',
+        plan: subscription.plan_name,
+        maxBranches: Number(subscription.max_branches),
+        requestedBranches,
+      });
+    }
+
     const status = subscription?.status === 'active' ? 'active' : 'trial';
-    const partner = await first("UPDATE partners SET owner_name=$1,phone=$2,restaurant_name=$3,restaurant_type=$4,city=$5,business_name=$6,gst_number=$7,business_type=$8,number_of_branches=$9,status=$10,onboarding_status='completed',onboarding_completed=TRUE,updated_at=NOW() WHERE id=$11 RETURNING *", [owner_name.trim(), phone.trim(), restaurant_name.trim(), restaurant_type.trim(), city.trim(), business_name.trim(), gst_number.trim(), business_type.trim(), Number(branch_count), status, req.userId]);
+
+    const partner = await first(
+      "UPDATE partners SET owner_name=$1,phone=$2,restaurant_name=$3,restaurant_type=$4,city=$5,business_name=$6,gst_number=$7,business_type=$8,number_of_branches=$9,status=$10,onboarding_status='completed',onboarding_completed=TRUE,updated_at=NOW() WHERE id=$11 RETURNING *",
+      [
+        owner_name.trim(),
+        phone.trim(),
+        restaurant_name.trim(),
+        restaurant_type.trim(),
+        city.trim(),
+        business_name.trim(),
+        gst_number.trim(),
+        business_type.trim(),
+        requestedBranches,
+        status,
+        req.userId,
+      ],
+    );
     if (!partner) return res.status(404).json({ error: 'Restaurant account not found.' });
     return res.json({ partner, onboarding_completed: true });
   } catch {
