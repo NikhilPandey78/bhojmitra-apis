@@ -373,29 +373,6 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
       });
     }
 
-    const order = await new Promise<any>((resolve, reject) => {
-      razorpay.orders.create(
-        {
-          amount: Math.round(amount * 100),
-          currency: 'INR',
-          receipt: `sub_${userId}_${Date.now()}`,
-          notes: {
-            partner_id: userId,
-            plan_id: String(plan.id),
-            plan_name: String(plan.name),
-            billing_cycle: billingCycle,
-          },
-        },
-        (error: any, createdOrder: any) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          resolve(createdOrder);
-        },
-      );
-    });
-
     const existingSubscription = await first(
       `SELECT id, plan_id, plan, billing_cycle, status, amount,
               expiry_date, payment_action,
@@ -407,6 +384,8 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
        LIMIT 1`,
       [userId],
     );
+
+    let order: any;
 
     /*
      * INITIAL PAYMENT
@@ -431,6 +410,29 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
           error: 'An existing subscription is already active.',
         });
       }
+
+      order = await new Promise<any>((resolve, reject) => {
+        razorpay.orders.create(
+          {
+            amount: Math.round(amount * 100),
+            currency: 'INR',
+            receipt: `sub_${userId}_${Date.now()}`,
+            notes: {
+              partner_id: userId,
+              plan_id: String(plan.id),
+              plan_name: String(plan.name),
+              billing_cycle: billingCycle,
+            },
+          },
+          (error: any, createdOrder: any) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            resolve(createdOrder);
+          },
+        );
+      });
 
       if (existingSubscription) {
         await db.query(
@@ -543,6 +545,29 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
           error: 'Renewal must use the current plan.',
         });
       }
+
+      order = await new Promise<any>((resolve, reject) => {
+        razorpay.orders.create(
+          {
+            amount: Math.round(amount * 100),
+            currency: 'INR',
+            receipt: `sub_${userId}_${Date.now()}`,
+            notes: {
+              partner_id: userId,
+              plan_id: String(plan.id),
+              plan_name: String(plan.name),
+              billing_cycle: billingCycle,
+            },
+          },
+          (error: any, createdOrder: any) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            resolve(createdOrder);
+          },
+        );
+      });
 
       await db.query(
         `UPDATE subscriptions
