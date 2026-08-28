@@ -14,4 +14,6 @@ export const config = {
   resendApiKey: process.env.RESEND_API_KEY,
   emailFrom: process.env.EMAIL_FROM || 'BhojMitra <onboarding@resend.dev>',
   demoRecipient: process.env.DEMO_RECIPIENT_EMAIL || 'bhojmitra@gmail.com',
+  razorpayKeyId: required('RAZORPAY_KEY_ID'),
+  razorpayKeySecret: required('RAZORPAY_KEY_SECRET'),
 };
