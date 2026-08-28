@@ -21,7 +21,13 @@ export async function initDatabase() {
   await db.query(`
     ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES subscription_plans(id);
     ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS payment_action TEXT;
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_plan_id INTEGER REFERENCES subscription_plans(id);
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_plan TEXT;
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_billing_cycle TEXT;
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_amount NUMERIC;
     ALTER TABLE partners ADD COLUMN IF NOT EXISTS onboarding_status TEXT NOT NULL DEFAULT 'pending';
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS free_trial_used_at TIMESTAMPTZ;
     UPDATE partners
     SET onboarding_status = CASE WHEN onboarding_completed THEN 'completed' ELSE 'pending' END
     WHERE onboarding_status IS NULL OR onboarding_status NOT IN ('pending', 'in_progress', 'completed');

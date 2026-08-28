@@ -79,14 +79,21 @@ app.post('/api/auth/register', async (req, res) => {
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      const trialPlan = (await client.query("SELECT * FROM subscription_plans WHERE name='Free Trial' AND is_active=TRUE")).rows[0];
-      if (!trialPlan) throw new Error('Free Trial plan is not configured.');
       const startDate = new Date();
-      const expiryDate = new Date(startDate);
-      expiryDate.setDate(expiryDate.getDate() + Number(trialPlan.trial_days || 14));
       await client.query('INSERT INTO users (id,email,password_hash) VALUES ($1,$2,$3)', [id, email.trim().toLowerCase(), await bcrypt.hash(password, 12)]);
-      await client.query('INSERT INTO partners (id,owner_name,restaurant_name,email,phone,onboarding_status,onboarding_completed) VALUES ($1,$2,$3,$4,$5,$6,FALSE)', [id, owner_name.trim(), restaurant_name.trim(), email.trim().toLowerCase(), phone.trim(), 'pending']);
-      await client.query('INSERT INTO subscriptions (id,partner_id,plan_id,plan,billing_cycle,status,start_date,expiry_date,auto_renew,amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9)', [randomUUID(), id, trialPlan.id, 'free trial', trialPlan.billing_cycle, 'trial', startDate, expiryDate, trialPlan.price]);
+      await client.query(
+  `INSERT INTO partners
+   (id,owner_name,restaurant_name,email,phone,onboarding_status,onboarding_completed)
+   VALUES ($1,$2,$3,$4,$5,$6,FALSE)`,
+  [
+    id,
+    owner_name.trim(),
+    restaurant_name.trim(),
+    email.trim().toLowerCase(),
+    phone.trim(),
+    'pending',
+  ]
+);
       await client.query('COMMIT');
       return res.status(201).json({ token: tokenFor(id), user: { id, email: email.trim().toLowerCase() } });
     } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
@@ -126,12 +133,69 @@ const subscriptionResponse = (subscription: any) => {
   };
 };
 
-app.get('/api/subscriptions/plans', async (_req, res) => {
+app.get('/api/subscriptions/plans', async (req: AuthenticatedRequest, res) => {
   try {
-    const plans = await db.query('SELECT id,name,price,billing_cycle,max_users,max_branches,trial_days,features,is_active FROM subscription_plans WHERE is_active=TRUE ORDER BY price ASC');
-    res.json({ success: true, plans: plans.rows });
-  } catch {
-    res.status(500).json({ success: false, message: 'Failed to fetch subscription plans' });
+    if (!req.userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required.',
+      });
+    }
+
+    const plans = await db.query(`
+      SELECT
+        id,
+        name,
+        price,
+        billing_cycle,
+        max_users,
+        max_branches,
+        trial_days,
+        features,
+        is_active
+      FROM subscription_plans
+      WHERE is_active = TRUE
+      ORDER BY price ASC
+    `);
+
+    const trialHistory = await first(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM subscriptions s
+         JOIN subscription_plans p ON p.id = s.plan_id
+         WHERE s.partner_id = $1
+           AND LOWER(p.name) = 'free trial'
+       ) AS trial_used`,
+      [req.userId],
+    );
+
+    const partner = await first(
+      `SELECT free_trial_used_at
+       FROM partners
+       WHERE id = $1`,
+      [req.userId],
+    );
+
+    const trialUsed =
+      Boolean(trialHistory?.trial_used) ||
+      Boolean(partner?.free_trial_used_at);
+
+    return res.json({
+      success: true,
+      plans: plans.rows,
+      freeTrial: {
+        available: !trialUsed,
+        used: trialUsed,
+        durationDays: 14,
+      },
+    });
+  } catch (error) {
+    console.error('GET /api/subscriptions/plans error:', error);
+
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch subscription plans',
+    });
   }
 });
 
@@ -264,7 +328,7 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
     const billingCycle = String(req.body?.billing_cycle || 'monthly').trim().toLowerCase();
     const action = String(req.body?.action || 'upgrade').trim().toLowerCase();
 
-    if (!['renew', 'upgrade', 'downgrade'].includes(action)) {
+    if (!['initial', 'renew', 'upgrade', 'downgrade'].includes(action)) {
       return res.status(400).json({ error: 'Invalid payment action.' });
     }
 
@@ -333,7 +397,10 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
     });
 
     const existingSubscription = await first(
-      `SELECT id, plan_id, plan, billing_cycle, status, amount
+      `SELECT id, plan_id, plan, billing_cycle, status, amount,
+              expiry_date, payment_action,
+              pending_plan_id, pending_plan,
+              pending_billing_cycle, pending_amount
        FROM subscriptions
        WHERE partner_id = $1
        ORDER BY created_at DESC
@@ -341,47 +408,152 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
       [userId],
     );
 
-    if (!existingSubscription) {
-      return res.status(404).json({
-        error: 'Subscription record not found.',
-      });
-    }
+    /*
+     * INITIAL PAYMENT
+     *
+     * First-time paid onboarding can create the subscription
+     * record in pending state. The selected paid plan is only
+     * activated after successful Razorpay verification.
+     */
+    if (action === 'initial') {
+      if (existingSubscription) {
+        await db.query(
+          `UPDATE subscriptions
+           SET pending_plan_id = $1,
+               pending_plan = $2,
+               pending_billing_cycle = $3,
+               pending_amount = $4,
+               status = 'pending',
+               razorpay_order_id = $5,
+               razorpay_payment_id = NULL,
+               razorpay_signature = NULL,
+               payment_action = $6,
+               updated_at = NOW()
+           WHERE id = $7
+             AND partner_id = $8`,
+          [
+            plan.id,
+            String(plan.name).toLowerCase(),
+            billingCycle,
+            amount,
+            order.id,
+            action,
+            existingSubscription.id,
+            userId,
+          ],
+        );
+      } else {
+        await db.query(
+          `INSERT INTO subscriptions
+           (id, partner_id, plan_id, plan, billing_cycle, status,
+            start_date, expiry_date, auto_renew, amount,
+            razorpay_order_id, razorpay_payment_id,
+            razorpay_signature, payment_action,
+            pending_plan_id, pending_plan,
+            pending_billing_cycle, pending_amount)
+           VALUES
+           ($1, $2, NULL, NULL, NULL, 'pending',
+            NULL, NULL, TRUE, 0,
+            $3, NULL, NULL, $4,
+            $5, $6, $7, $8)`,
+          [
+            randomUUID(),
+            userId,
+            order.id,
+            action,
+            plan.id,
+            String(plan.name).toLowerCase(),
+            billingCycle,
+            amount,
+          ],
+        );
+      }
+    } else {
+      /*
+       * RENEW / UPGRADE / DOWNGRADE
+       * Existing active subscription is never changed before
+       * successful payment verification.
+       */
+      if (!existingSubscription) {
+        return res.status(404).json({
+          error: 'Subscription record not found.',
+        });
+      }
 
-    if (action === 'upgrade' &&
-        Number(plan.price) <= Number(existingSubscription.amount)) {
-      return res.status(400).json({
-        error: 'Selected plan is not an upgrade.',
-      });
-    }
+      if (
+        (action === 'upgrade' || action === 'downgrade') &&
+        existingSubscription.status !== 'active'
+      ) {
+        return res.status(400).json({
+          error: 'An active subscription is required for this action.',
+        });
+      }
 
-    if (action === 'downgrade' &&
-        Number(plan.price) >= Number(existingSubscription.amount)) {
-      return res.status(400).json({
-        error: 'Selected plan is not a downgrade.',
-      });
-    }
+      if (
+        action === 'renew' &&
+        !['active', 'expired'].includes(
+          String(existingSubscription.status).toLowerCase(),
+        )
+      ) {
+        return res.status(400).json({
+          error: 'Subscription is not eligible for renewal.',
+        });
+      }
 
-    if (action === 'renew' &&
-        String(plan.name).toLowerCase() !== String(existingSubscription.plan).toLowerCase()) {
-      return res.status(400).json({
-        error: 'Renewal must use the current plan.',
-      });
-    }
+      if (
+        action === 'upgrade' &&
+        Number(plan.price) <= Number(existingSubscription.amount)
+      ) {
+        return res.status(400).json({
+          error: 'Selected plan is not an upgrade.',
+        });
+      }
 
-    await db.query(
-      `UPDATE subscriptions
-       SET razorpay_order_id = $1,
-           razorpay_payment_id = NULL,
-           razorpay_signature = NULL,
-           updated_at = NOW()
-       WHERE id = $2
-         AND partner_id = $3`,
-      [
-        order.id,
-        existingSubscription.id,
-        userId,
-      ],
-    );
+      if (
+        action === 'downgrade' &&
+        Number(plan.price) >= Number(existingSubscription.amount)
+      ) {
+        return res.status(400).json({
+          error: 'Selected plan is not a downgrade.',
+        });
+      }
+
+      if (
+        action === 'renew' &&
+        String(plan.name).toLowerCase() !==
+          String(existingSubscription.plan).toLowerCase()
+      ) {
+        return res.status(400).json({
+          error: 'Renewal must use the current plan.',
+        });
+      }
+
+      await db.query(
+        `UPDATE subscriptions
+         SET razorpay_order_id = $1,
+             razorpay_payment_id = NULL,
+             razorpay_signature = NULL,
+             payment_action = $2,
+             pending_plan_id = $3,
+             pending_plan = $4,
+             pending_billing_cycle = $5,
+             pending_amount = $6,
+             updated_at = NOW()
+         WHERE id = $7
+           AND partner_id = $8
+           AND status = 'active'`,
+        [
+          order.id,
+          action,
+          plan.id,
+          String(plan.name).toLowerCase(),
+          billingCycle,
+          amount,
+          existingSubscription.id,
+          userId,
+        ],
+      );
+    }
 
     return res.json({
       orderId: order.id,
@@ -402,23 +574,36 @@ app.post('/api/payments/create-order', requireAuth, async (req: AuthenticatedReq
 
 
 app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, res) => {
+  if (!req.userId) {
+    return res.status(401).json({
+      error: 'Authentication required.',
+    });
+  }
+
+  const userId = req.userId;
+
+  const razorpayOrderId = String(
+    req.body?.razorpay_order_id || '',
+  ).trim();
+
+  const razorpayPaymentId = String(
+    req.body?.razorpay_payment_id || '',
+  ).trim();
+
+  const razorpaySignature = String(
+    req.body?.razorpay_signature || '',
+  ).trim();
+
+  if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+    return res.status(400).json({
+      error: 'Payment verification details are required.',
+    });
+  }
+
   try {
-    if (!req.userId) {
-      return res.status(401).json({ error: 'Authentication required.' });
-    }
-
-    const userId: string = req.userId;
-
-    const razorpayOrderId = String(req.body?.razorpay_order_id || '').trim();
-    const razorpayPaymentId = String(req.body?.razorpay_payment_id || '').trim();
-    const razorpaySignature = String(req.body?.razorpay_signature || '').trim();
-
-    if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
-      return res.status(400).json({
-        error: 'Payment verification details are required.',
-      });
-    }
-
+    /*
+     * Find the exact pending order belonging to this user.
+     */
     const subscription = await first(
       `SELECT *
        FROM subscriptions
@@ -435,6 +620,9 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, 
       });
     }
 
+    /*
+     * Verify Razorpay signature.
+     */
     const generatedSignature = createHmac(
       'sha256',
       config.razorpayKeySecret,
@@ -449,28 +637,8 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, 
     }
 
     /*
-     * Payment/order information is stored against the subscription.
-     * The subscription action is determined from the order's current
-     * subscription state.
-     */
-    const previousPlan = String(subscription.plan || '').toLowerCase();
-
-    const currentPlan = await first(
-      `SELECT id, name, price, billing_cycle
-       FROM subscription_plans
-       WHERE id = $1
-       LIMIT 1`,
-      [subscription.plan_id],
-    );
-
-    if (!currentPlan) {
-      return res.status(400).json({
-        error: 'Subscription plan could not be verified.',
-      });
-    }
-
-    /*
-     * Prevent duplicate verification.
+     * Idempotency:
+     * same payment cannot activate the subscription twice.
      */
     if (
       subscription.status === 'active' &&
@@ -482,15 +650,17 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, 
         subscription: {
           id: subscription.id,
           status: subscription.status,
-          plan: previousPlan,
+          plan: subscription.plan,
+          billingCycle: subscription.billing_cycle,
+          amount: subscription.amount,
+          startDate: subscription.start_date,
           expiryDate: subscription.expiry_date,
         },
       });
     }
 
     /*
-     * The order must still be pending.
-     * This prevents reusing an already processed subscription order.
+     * Only pending orders can be activated.
      */
     if (subscription.status !== 'pending') {
       return res.status(400).json({
@@ -498,22 +668,61 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, 
       });
     }
 
-    const startDate = new Date();
+    const action = String(
+      subscription.payment_action || 'initial',
+    ).toLowerCase();
+
+    if (!['initial', 'renew', 'upgrade', 'downgrade'].includes(action)) {
+      return res.status(400).json({
+        error: 'Invalid payment action stored for this order.',
+      });
+    }
 
     /*
-     * Renew an existing active subscription from the frontend flow:
-     * the order was created for the same current plan.
-     *
-     * Upgrade/downgrade orders already changed plan_id/plan/amount
-     * to the selected plan before payment. Therefore successful
-     * verification activates that selected plan.
+     * Get the plan attached to this payment order.
      */
-    const expiryDate = new Date(startDate);
+    /*
+     * The plan attached to the payment order is stored in
+     * pending_plan_id. The active plan must remain untouched
+     * until payment verification succeeds.
+     */
+    const selectedPlanId = subscription.pending_plan_id;
 
-    if (subscription.billing_cycle === 'yearly') {
-      expiryDate.setFullYear(expiryDate.getFullYear() + 1);
-    } else {
-      expiryDate.setMonth(expiryDate.getMonth() + 1);
+    if (!selectedPlanId) {
+      return res.status(400).json({
+        error: 'Pending payment plan could not be verified.',
+      });
+    }
+
+    const selectedPlan = await first(
+      `SELECT id, name, price, billing_cycle, is_active
+       FROM subscription_plans
+       WHERE id = $1
+       LIMIT 1`,
+      [selectedPlanId],
+    );
+
+    if (!selectedPlan) {
+      return res.status(400).json({
+        error: 'Selected subscription plan could not be found.',
+      });
+    }
+
+    if (!selectedPlan.is_active) {
+      return res.status(400).json({
+        error: 'Selected subscription plan is no longer active.',
+      });
+    }
+
+    /*
+     * Free Trial must never be activated through Razorpay.
+     */
+    if (
+      String(selectedPlan.name).toLowerCase() === 'free trial'
+    ) {
+      return res.status(400).json({
+        error: 'Free Trial cannot be activated through payment.',
+      });
     }
 
     const client = await db.connect();
@@ -521,68 +730,227 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, 
     try {
       await client.query('BEGIN');
 
-      const updatedSubscription = await client.query(
-        `UPDATE subscriptions
-         SET status = 'active',
-             start_date = $1,
-             expiry_date = $2,
-             razorpay_payment_id = $3,
-             razorpay_signature = $4,
-             updated_at = NOW()
-         WHERE id = $5
-           AND partner_id = $6
-           AND status = 'pending'
-           AND razorpay_order_id = $7
-         RETURNING *`,
+      /*
+       * Lock the subscription row while activating the payment.
+       * This prevents two simultaneous verification requests
+       * from activating the same order.
+       */
+      const lockedResult = await client.query(
+        `SELECT *
+         FROM subscriptions
+         WHERE id = $1
+           AND partner_id = $2
+           AND razorpay_order_id = $3
+         FOR UPDATE`,
         [
-          startDate,
-          expiryDate,
-          razorpayPaymentId,
-          razorpaySignature,
           subscription.id,
           userId,
           razorpayOrderId,
         ],
       );
 
-      if (!updatedSubscription.rows[0]) {
-        throw new Error('Subscription could not be activated.');
+      const lockedSubscription = lockedResult.rows[0];
+
+      if (!lockedSubscription) {
+        throw new Error('Subscription record could not be locked.');
       }
 
-      const activatedSubscription = updatedSubscription.rows[0];
+      if (lockedSubscription.status !== 'pending') {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          error: 'This payment order has already been processed.',
+        });
+      }
+
+      const paymentAction = String(
+        lockedSubscription.payment_action || action,
+      ).toLowerCase();
 
       /*
-       * Create invoice only after successful Razorpay signature
-       * verification and successful subscription activation.
+       * INITIAL:
+       * New paid subscription starts from payment time.
+       *
+       * UPGRADE / DOWNGRADE:
+       * New selected plan starts from payment time.
+       */
+      let startDate = new Date();
+
+      /*
+       * RENEW:
+       * If the current subscription is still active and has a
+       * future expiry date, preserve the remaining subscription
+       * period and extend from the existing expiry date.
+       *
+       * If already expired, renewal starts from now.
+       */
+      if (paymentAction === 'renew') {
+        const existingExpiry = lockedSubscription.expiry_date
+          ? new Date(lockedSubscription.expiry_date)
+          : null;
+
+        if (
+          existingExpiry &&
+          !Number.isNaN(existingExpiry.getTime()) &&
+          existingExpiry.getTime() > startDate.getTime()
+        ) {
+          startDate = existingExpiry;
+        }
+      }
+
+      const expiryDate = new Date(startDate);
+
+      if (
+        String(selectedPlan.billing_cycle).toLowerCase() === 'yearly'
+      ) {
+        expiryDate.setFullYear(
+          expiryDate.getFullYear() + 1,
+        );
+      } else {
+        expiryDate.setMonth(
+          expiryDate.getMonth() + 1,
+        );
+      }
+
+      /*
+       * For renewal, make sure the plan being renewed is the
+       * same plan that was active when the order was created.
+       */
+      if (paymentAction === 'renew') {
+        const currentActiveSubscription = await client.query(
+          `SELECT s.id, s.plan_id, s.plan, s.status
+           FROM subscriptions s
+           WHERE s.partner_id = $1
+           ORDER BY s.updated_at DESC NULLS LAST,
+                    s.created_at DESC
+           LIMIT 1
+           FOR UPDATE`,
+          [userId],
+        );
+
+        const current = currentActiveSubscription.rows[0];
+
+        if (!current) {
+          throw new Error(
+            'Current subscription could not be verified for renewal.',
+          );
+        }
+
+        if (current.id !== lockedSubscription.id) {
+          throw new Error(
+            'Renewal order does not belong to the current subscription.',
+          );
+        }
+
+        if (current.status !== 'pending' && current.status !== 'active' && current.status !== 'expired') {
+          throw new Error(
+            'Current subscription is not eligible for renewal.',
+          );
+        }
+
+        if (
+          String(current.plan_id) !== String(selectedPlan.id)
+        ) {
+          throw new Error(
+            'Renewal plan no longer matches the current subscription.',
+          );
+        }
+      }
+
+      /*
+       * Activate only after signature verification.
+       */
+      const updatedResult = await client.query(
+        `UPDATE subscriptions
+         SET plan_id = $1,
+             plan = $2,
+             billing_cycle = $3,
+             status = 'active',
+             start_date = $4,
+             expiry_date = $5,
+             amount = $6,
+             razorpay_payment_id = $7,
+             razorpay_signature = $8,
+             pending_plan_id = NULL,
+             pending_plan = NULL,
+             pending_billing_cycle = NULL,
+             pending_amount = NULL,
+             updated_at = NOW()
+         WHERE id = $9
+           AND partner_id = $10
+           AND status = 'pending'
+           AND razorpay_order_id = $11
+         RETURNING *`,
+        [
+          selectedPlan.id,
+          String(selectedPlan.name).toLowerCase(),
+          String(selectedPlan.billing_cycle).toLowerCase(),
+          startDate,
+          expiryDate,
+          Number(selectedPlan.price),
+          razorpayPaymentId,
+          razorpaySignature,
+          lockedSubscription.id,
+          userId,
+          razorpayOrderId,
+        ],
+      );
+
+      if (!updatedResult.rows[0]) {
+        throw new Error(
+          'Subscription could not be activated.',
+        );
+      }
+
+      const activatedSubscription =
+        updatedResult.rows[0];
+
+      /*
+       * Invoice is created only after successful activation.
        */
       await client.query(
         `INSERT INTO invoices
-         (id, partner_id, invoice_number, invoice_date, plan, amount, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'paid')`,
+         (id, partner_id, invoice_number, invoice_date,
+          plan, amount, status)
+         VALUES
+         ($1, $2, $3, $4, $5, $6, 'paid')`,
         [
           randomUUID(),
           userId,
-          `INV-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`,
-          startDate,
+          `INV-${Date.now()}-${Math.floor(
+            1000 + Math.random() * 9000,
+          )}`,
+          new Date(),
           String(activatedSubscription.plan),
           activatedSubscription.amount,
         ],
       );
 
       /*
-       * Payment notification is also created only after successful
-       * payment verification.
+       * Payment notification.
        */
+      const actionMessage =
+        paymentAction === 'renew'
+          ? 'subscription renewed'
+          : paymentAction === 'upgrade'
+            ? 'subscription upgraded'
+            : paymentAction === 'downgrade'
+              ? 'subscription changed'
+              : 'subscription activated';
+
       await client.query(
         `INSERT INTO notifications
          (id, partner_id, type, title, message, is_read)
-         VALUES ($1, $2, $3, $4, $5, FALSE)`,
+         VALUES
+         ($1, $2, $3, $4, $5, FALSE)`,
         [
           randomUUID(),
           userId,
           'payment',
           'Payment Successful',
-          `Your ${String(activatedSubscription.plan)} subscription is now active until ${expiryDate.toISOString()}.`,
+          `Your ${String(
+            activatedSubscription.plan,
+          )} subscription has been ${actionMessage} and is active until ${expiryDate.toISOString()}.`,
         ],
       );
 
@@ -595,10 +963,14 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, 
           id: activatedSubscription.id,
           status: activatedSubscription.status,
           plan: activatedSubscription.plan,
-          billingCycle: activatedSubscription.billing_cycle,
+          billingCycle:
+            activatedSubscription.billing_cycle,
           amount: activatedSubscription.amount,
-          startDate: activatedSubscription.start_date,
-          expiryDate: activatedSubscription.expiry_date,
+          startDate:
+            activatedSubscription.start_date,
+          expiryDate:
+            activatedSubscription.expiry_date,
+          paymentAction,
         },
       });
     } catch (error) {
@@ -608,7 +980,10 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthenticatedRequest, 
       client.release();
     }
   } catch (error) {
-    console.error('POST /api/payments/verify error:', error);
+    console.error(
+      'POST /api/payments/verify error:',
+      error,
+    );
 
     return res.status(500).json({
       error: 'Failed to verify payment.',
@@ -700,6 +1075,193 @@ app.post('/api/me', async (req: AuthenticatedRequest, res) => {
     });
   }
 });
+
+app.post('/api/subscriptions/start-trial', async (req: AuthenticatedRequest, res) => {
+  if (!req.userId) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+    });
+  }
+
+  const userId = req.userId;
+
+  const client = await db.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const partnerResult = await client.query(
+      `SELECT id, free_trial_used_at
+       FROM partners
+       WHERE id = $1
+       FOR UPDATE`,
+      [userId],
+    );
+
+    const partner = partnerResult.rows[0];
+
+    if (!partner) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        success: false,
+        message: 'Restaurant account not found.',
+      });
+    }
+
+    if (partner.free_trial_used_at) {
+      await client.query('ROLLBACK');
+
+      return res.status(403).json({
+        success: false,
+        code: 'FREE_TRIAL_ALREADY_USED',
+        message: 'Free Trial has already been used.',
+      });
+    }
+
+    const trialPlanResult = await client.query(
+      `SELECT id, name, price, billing_cycle, trial_days
+       FROM subscription_plans
+       WHERE LOWER(name) = 'free trial'
+         AND is_active = TRUE
+       LIMIT 1`,
+    );
+
+    const trialPlan = trialPlanResult.rows[0];
+
+    if (!trialPlan) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        success: false,
+        message: 'Free Trial plan is not available.',
+      });
+    }
+
+    const trialDays =
+      Number(trialPlan.trial_days) > 0
+        ? Number(trialPlan.trial_days)
+        : 14;
+
+    if (trialDays !== 14) {
+      await client.query('ROLLBACK');
+
+      return res.status(500).json({
+        success: false,
+        message: 'Free Trial configuration must be exactly 14 days.',
+      });
+    }
+
+    const startDate = new Date();
+    const expiryDate = new Date(startDate);
+    expiryDate.setDate(expiryDate.getDate() + 14);
+
+    const existingSubscriptionResult = await client.query(
+      `SELECT id
+       FROM subscriptions
+       WHERE partner_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [userId],
+    );
+
+    const existingSubscription =
+      existingSubscriptionResult.rows[0];
+
+    let subscription;
+
+    if (existingSubscription) {
+      const subscriptionResult = await client.query(
+        `UPDATE subscriptions
+         SET plan_id = $1,
+             plan = $2,
+             billing_cycle = $3,
+             status = 'trial',
+             start_date = $4,
+             expiry_date = $5,
+             auto_renew = FALSE,
+             amount = 0,
+             razorpay_order_id = NULL,
+             razorpay_payment_id = NULL,
+             razorpay_signature = NULL,
+             updated_at = NOW()
+         WHERE id = $6
+           AND partner_id = $7
+         RETURNING *`,
+        [
+          trialPlan.id,
+          String(trialPlan.name).toLowerCase(),
+          trialPlan.billing_cycle || 'monthly',
+          startDate,
+          expiryDate,
+          existingSubscription.id,
+          userId,
+        ],
+      );
+
+      subscription = subscriptionResult.rows[0];
+    } else {
+      const subscriptionResult = await client.query(
+        `INSERT INTO subscriptions
+         (id, partner_id, plan_id, plan, billing_cycle, status,
+          start_date, expiry_date, auto_renew, amount)
+         VALUES ($1, $2, $3, $4, $5, 'trial', $6, $7, FALSE, 0)
+         RETURNING *`,
+        [
+          randomUUID(),
+          userId,
+          trialPlan.id,
+          String(trialPlan.name).toLowerCase(),
+          trialPlan.billing_cycle || 'monthly',
+          startDate,
+          expiryDate,
+        ],
+      );
+
+      subscription = subscriptionResult.rows[0];
+    }
+
+    if (!subscription) {
+      throw new Error('Unable to create Free Trial subscription.');
+    }
+
+    await client.query(
+      `UPDATE partners
+       SET free_trial_used_at = NOW(),
+           status = 'active',
+           updated_at = NOW()
+       WHERE id = $1`,
+      [userId],
+    );
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      success: true,
+      message: 'Free Trial activated successfully.',
+      subscription,
+      trial: {
+        startDate,
+        expiryDate,
+        durationDays: 14,
+      },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    console.error('POST /api/subscriptions/start-trial error:', error);
+
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to activate Free Trial.',
+    });
+  } finally {
+    client.release();
+  }
+});
+
 app.post('/api/onboarding/complete', async (req: AuthenticatedRequest, res) => {
   const { owner_name, phone, restaurant_name, restaurant_type, city, business_name, gst_number, business_type, branch_count, branch_city } = req.body;
   const required = { owner_name, phone, restaurant_name, restaurant_type, city, business_name, gst_number, business_type, branch_city };
