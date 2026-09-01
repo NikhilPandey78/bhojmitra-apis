@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { randomUUID, createHmac } from 'node:crypto';
+import { randomUUID, createHmac, randomBytes, createHash } from 'node:crypto';
 import Razorpay from 'razorpay';
 import { config } from './config.js';
 import { db, initDatabase } from './db.js';
@@ -12,7 +12,28 @@ import { demoRequestSchema, ticketSchema } from './validation.js';
 import { referenceId } from './utils.js';
 
 const app = express();
-app.use(cors({ origin: config.corsOrigin }));
+
+const allowedOrigins = [
+  'https://bhojmitra.in',
+  'https://myresto.bhojmitra.in',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+  config.corsOrigin,
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.bhojmitra.in')) {
+        return callback(null, true);
+      }
+      return callback(null, true); // Permissive in dev/fallback with credentials allowed
+    },
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: '1mb' }));
 const tokenFor = (id: string) => jwt.sign({ sub: id }, config.jwtSecret, { expiresIn: '7d' });
 const first = async (sql: string, values: unknown[] = []) => (await db.query(sql, values)).rows[0];
@@ -102,7 +123,252 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => { const user = await first('SELECT id,email,password_hash FROM users WHERE email=$1', [String(req.body.email || '').trim().toLowerCase()]); if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.password_hash))) return res.status(401).json({ error: 'Invalid email or password.' }); return res.json({ token: tokenFor(user.id), user: { id: user.id, email: user.email } }); });
 app.post('/api/demo-requests', async (req, res) => { const parsed = demoRequestSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: 'Invalid demo request.' }); const ref = referenceId('DMO'); const d = parsed.data; const request = await first('INSERT INTO demo_requests (id,name,restaurant_name,email,phone,city,number_of_branches,preferred_date,preferred_time,message,reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [randomUUID(), d.name,d.restaurant_name,d.email,d.phone,d.city,d.number_of_branches,d.preferred_date,d.preferred_time,d.message,ref]); return res.status(201).json({ request, reference_id: ref }); });
 app.post('/api/contact-queries', async (req, res) => { const { name,email,phone,subject,message } = req.body; if (![name,email,phone,subject,message].every((v) => typeof v === 'string' && v.trim())) return res.status(400).json({ error: 'All contact fields are required.' }); const query = await first('INSERT INTO contact_queries (id,name,email,phone,subject,message,reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [randomUUID(),name,email,phone,subject,message,referenceId('QRY')]); return res.status(201).json({ query }); });
+
+// ============================================================
+// SINGLE SIGN-ON (SSO) PUBLIC ENDPOINTS
+// ============================================================
+
+app.post('/api/auth/sso/exchange', async (req, res) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  if (!code || !/^[a-f0-9]{64}$/i.test(code)) {
+    return res.status(400).json({ error: 'Valid SSO authorization code is required.' });
+  }
+
+  const codeHash = createHash('sha256').update(code).digest('hex');
+  const client = await db.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const ssoRow = (
+      await client.query(
+        `SELECT sso.*, p.owner_name, p.restaurant_name, p.email, p.phone, p.status AS partner_status,
+                p.restaurant_type, p.city, p.number_of_branches, p.onboarding_completed,
+                s.id AS subscription_id, s.plan AS subscription_plan, s.status AS subscription_status,
+                s.start_date, s.expiry_date, s.billing_cycle, s.auto_renew, s.amount,
+                sp.max_users, sp.max_branches
+         FROM sso_authorization_codes sso
+         JOIN partners p ON p.id = sso.partner_id
+         LEFT JOIN subscriptions s ON s.partner_id = p.id
+         LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
+         WHERE sso.code_hash = $1
+           AND sso.target_app = 'myresto'
+           AND sso.used_at IS NULL
+           AND sso.expires_at > NOW()
+         FOR UPDATE OF sso`,
+        [codeHash]
+      )
+    ).rows[0];
+
+    if (!ssoRow) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ error: 'SSO authorization code is invalid or has expired.' });
+    }
+
+    await client.query('UPDATE sso_authorization_codes SET used_at = NOW() WHERE id = $1', [ssoRow.id]);
+    await client.query('COMMIT');
+
+    const token = jwt.sign(
+      {
+        sub: ssoRow.partner_id,
+        partner_id: ssoRow.partner_id,
+        email: ssoRow.email,
+        restaurant_name: ssoRow.restaurant_name,
+        owner_name: ssoRow.owner_name,
+        role: 'owner',
+        app: 'myresto',
+        type: 'sso_session',
+      },
+      config.jwtSecret,
+      { expiresIn: '7d' }
+    );
+
+    const subscriptionPlan = (ssoRow.subscription_plan || 'trial').toLowerCase();
+    const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
+    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 4;
+
+    return res.json({
+      success: true,
+      token,
+      user: {
+        id: ssoRow.partner_id,
+        email: ssoRow.email,
+        app_metadata: { provider: 'sso' },
+        user_metadata: { full_name: ssoRow.owner_name, restaurant_name: ssoRow.restaurant_name },
+        aud: 'authenticated',
+      },
+      restaurant: {
+        id: ssoRow.partner_id,
+        name: ssoRow.restaurant_name,
+        legal_name: ssoRow.restaurant_name,
+        email: ssoRow.email,
+        phone: ssoRow.phone || null,
+        address: ssoRow.city || '',
+        city: ssoRow.city || '',
+        state: '',
+        postal_code: '',
+        country: 'India',
+        currency: 'INR',
+        logo_url: null,
+        status: 'active',
+        created_at: ssoRow.created_at,
+        updated_at: ssoRow.created_at,
+      },
+      restaurantUser: {
+        id: ssoRow.partner_id,
+        restaurant_id: ssoRow.partner_id,
+        auth_user_id: ssoRow.partner_id,
+        branch_id: null,
+        full_name: ssoRow.owner_name,
+        email: ssoRow.email,
+        phone: ssoRow.phone || null,
+        role: 'owner',
+        status: 'active',
+        created_at: ssoRow.created_at,
+      },
+      subscription: {
+        id: ssoRow.subscription_id || ssoRow.partner_id,
+        restaurant_id: ssoRow.partner_id,
+        plan: ssoRow.subscription_plan || 'trial',
+        status: ssoRow.subscription_status || 'trial',
+        start_date: ssoRow.start_date ? new Date(ssoRow.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
+        expiry_date: ssoRow.expiry_date ? new Date(ssoRow.expiry_date).toISOString().slice(0, 10) : new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10),
+        billing_cycle: ssoRow.billing_cycle || 'monthly',
+        amount: Number(ssoRow.amount || 0),
+        currency: 'INR',
+        auto_renewal: Boolean(ssoRow.auto_renew),
+        max_branches: ssoRow.max_branches ?? defaultBranches,
+        max_users: ssoRow.max_users ?? defaultUsers,
+        created_at: ssoRow.created_at,
+        updated_at: ssoRow.created_at,
+      },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/auth/sso/me', async (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ error: 'Bearer token is required.' });
+
+  try {
+    const payload = jwt.verify(token, config.jwtSecret) as { sub?: string; app?: string };
+    if (!payload.sub || payload.app !== 'myresto') {
+      return res.status(401).json({ error: 'Invalid SSO session token.' });
+    }
+
+    const partner = await first('SELECT * FROM partners WHERE id=$1', [payload.sub]);
+    if (!partner) return res.status(404).json({ error: 'Partner profile not found.' });
+
+    const sub = await first(
+      `SELECT s.*, sp.max_users, sp.max_branches
+       FROM subscriptions s
+       LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
+       WHERE s.partner_id=$1`,
+      [payload.sub]
+    );
+
+    const subscriptionPlan = (sub?.plan || 'trial').toLowerCase();
+    const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
+    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 4;
+
+    return res.json({
+      success: true,
+      user: {
+        id: partner.id,
+        email: partner.email,
+        app_metadata: { provider: 'sso' },
+        user_metadata: { full_name: partner.owner_name, restaurant_name: partner.restaurant_name },
+        aud: 'authenticated',
+      },
+      restaurant: {
+        id: partner.id,
+        name: partner.restaurant_name,
+        legal_name: partner.restaurant_name,
+        email: partner.email,
+        phone: partner.phone || null,
+        city: partner.city || '',
+        currency: 'INR',
+        status: 'active',
+      },
+      restaurantUser: {
+        id: partner.id,
+        restaurant_id: partner.id,
+        auth_user_id: partner.id,
+        full_name: partner.owner_name,
+        email: partner.email,
+        phone: partner.phone || null,
+        role: 'owner',
+        status: 'active',
+      },
+      subscription: sub
+        ? {
+            id: sub.id,
+            restaurant_id: partner.id,
+            plan: sub.plan,
+            status: sub.status,
+            start_date: sub.start_date ? new Date(sub.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
+            expiry_date: sub.expiry_date ? new Date(sub.expiry_date).toISOString().slice(0, 10) : new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10),
+            billing_cycle: sub.billing_cycle || 'monthly',
+            amount: Number(sub.amount || 0),
+            currency: 'INR',
+            auto_renewal: Boolean(sub.auto_renew),
+            max_branches: sub.max_branches ?? defaultBranches,
+            max_users: sub.max_users ?? defaultUsers,
+          }
+        : null,
+    });
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired session token.' });
+  }
+});
+
 app.use('/api', requireAuth);
+
+app.post('/api/auth/my-resto-sso', async (req: AuthenticatedRequest, res) => {
+  if (!req.userId) return res.status(401).json({ error: 'Unauthorized.' });
+  const partner = await first('SELECT * FROM partners WHERE id=$1', [req.userId]);
+  if (!partner) return res.status(404).json({ error: 'Partner profile not found.' });
+
+  if (!partner.onboarding_completed) {
+    return res.status(403).json({
+      error: 'Please complete onboarding before accessing My Restaurant.',
+      code: 'ONBOARDING_REQUIRED',
+    });
+  }
+
+  await expireSubscriptions(req.userId);
+  const subscription = await first('SELECT * FROM subscriptions WHERE partner_id=$1', [req.userId]);
+  if (!subscription || !ACCESSIBLE_SUBSCRIPTION_STATUSES.has(subscription.status)) {
+    return res.status(403).json({
+      error: 'Your subscription is expired or inactive. Please renew to access your restaurant.',
+      code: 'SUBSCRIPTION_INACTIVE',
+    });
+  }
+
+  const rawCode = randomBytes(32).toString('hex');
+  const codeHash = createHash('sha256').update(rawCode).digest('hex');
+  const id = randomUUID();
+  const expiresAt = new Date(Date.now() + 60 * 1000); // 60 seconds TTL
+
+  await db.query(
+    `INSERT INTO sso_authorization_codes (id, code_hash, partner_id, user_id, target_app, expires_at)
+     VALUES ($1, $2, $3, $4, 'myresto', $5)`,
+    [id, codeHash, req.userId, req.userId, expiresAt]
+  );
+
+  const ssoUrl = `${config.myRestoUrl.replace(/\/$/, '')}/sso/callback?code=${rawCode}`;
+  return res.json({
+    success: true,
+    sso_url: ssoUrl,
+    code: rawCode,
+    expires_in: 60,
+  });
+});
 
 const subscriptionSelect = `
   SELECT s.id, s.partner_id AS user_id, s.start_date, s.expiry_date, s.auto_renew, s.status,

@@ -16,4 +16,5 @@ export const config = {
   demoRecipient: process.env.DEMO_RECIPIENT_EMAIL || 'bhojmitra@gmail.com',
   razorpayKeyId: required('RAZORPAY_KEY_ID'),
   razorpayKeySecret: required('RAZORPAY_KEY_SECRET'),
+  myRestoUrl: process.env.MY_RESTO_URL || 'https://myresto.bhojmitra.in',
 };
