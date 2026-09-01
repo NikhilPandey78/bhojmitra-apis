@@ -1,3 +1,3 @@
 import type { Request } from 'express';
 
-export type AuthenticatedRequest = Request & { userId?: string };
+export type AuthenticatedRequest = Request & { userId?: string; tenantId?: string };

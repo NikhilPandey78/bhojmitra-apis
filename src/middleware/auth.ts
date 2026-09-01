@@ -18,6 +18,29 @@ export async function requireAuth(req: AuthenticatedRequest, res: Response, next
   }
 }
 
+export async function requireTenantIsolation(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Authentication required for tenant isolation.' });
+  }
+
+  try {
+    // Verify the authenticated user is a valid partner
+    const partner = await db.query('SELECT id FROM partners WHERE id=$1', [req.userId]);
+    if (!partner.rows[0]) {
+      return res.status(403).json({
+        error: 'Access denied. User profile not found.',
+        code: 'INVALID_TENANT',
+      });
+    }
+
+    // Set tenant_id (partner_id) on request for use in all operations
+    req.tenantId = req.userId;
+    return next();
+  } catch (error) {
+    return res.status(500).json({ error: 'Unable to verify tenant access.' });
+  }
+}
+
 export async function requireCompletedOnboarding(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   try {
     const result = await db.query('SELECT onboarding_completed FROM partners WHERE id=$1', [req.userId]);
