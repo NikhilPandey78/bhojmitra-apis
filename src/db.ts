@@ -51,9 +51,11 @@ export async function initDatabase() {
       phone TEXT,
       role TEXT NOT NULL DEFAULT 'staff',
       status TEXT NOT NULL DEFAULT 'active',
+      permissions JSONB DEFAULT '[]',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE restaurant_users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]';
     CREATE INDEX IF NOT EXISTS idx_resto_users_restaurant ON restaurant_users(restaurant_id);
 
     CREATE TABLE IF NOT EXISTS categories (

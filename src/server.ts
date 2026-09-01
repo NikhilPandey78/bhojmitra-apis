@@ -2027,7 +2027,13 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
     const keys = Object.keys(item).filter(k => k !== 'category' && k !== 'unit' && k !== 'supplier' && k !== 'item' && k !== 'from_unit' && k !== 'to_unit' && k !== 'items');
     const cols = keys.map(k => `"${k}"`).join(', ');
     const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
-    const vals = keys.map(k => item[k]);
+    const vals = keys.map(k => {
+      const v = item[k];
+      if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
+        return JSON.stringify(v);
+      }
+      return v;
+    });
 
     const sql = `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON CONFLICT (id) DO UPDATE SET ${keys.map(k => `"${k}" = EXCLUDED."${k}"`).join(', ')} RETURNING *`;
     const row = await first(sql, vals);
@@ -2072,7 +2078,13 @@ app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, re
   if (keys.length === 0) return res.json({ data: null });
 
   const setClauses = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');
-  const vals = keys.map(k => item[k]);
+  const vals = keys.map(k => {
+    const v = item[k];
+    if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
+      return JSON.stringify(v);
+    }
+    return v;
+  });
   vals.push(id);
   vals.push(partnerId);
 
