@@ -2013,103 +2013,128 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
     return res.status(400).json({ error: `Unknown resource: ${table}` });
   }
 
-  const items = Array.isArray(req.body) ? req.body : [req.body];
+  try {
+    const items = Array.isArray(req.body) ? req.body : [req.body];
 
-  if (table === 'branches') {
-    const sub = await first(
-      `SELECT s.*, p.max_branches, p.name AS plan_name
-       FROM subscriptions s
-       LEFT JOIN subscription_plans p ON p.id = s.plan_id
-       WHERE s.partner_id = $1
-       ORDER BY CASE
-         WHEN s.status = 'active' THEN 1
-         WHEN s.status = 'trial' THEN 2
-         ELSE 3
-       END,
-       s.updated_at DESC NULLS LAST,
-       s.created_at DESC
-       LIMIT 1`,
-      [partnerId]
-    );
-    const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
-    const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
-    const maxBranches = Number(sub?.max_branches ?? defaultBranches);
+    if (table === 'branches') {
+      const sub = await first(
+        `SELECT s.*, p.max_branches, p.name AS plan_name
+         FROM subscriptions s
+         LEFT JOIN subscription_plans p ON p.id = s.plan_id
+         WHERE s.partner_id = $1
+         ORDER BY CASE
+           WHEN s.status = 'active' THEN 1
+           WHEN s.status = 'trial' THEN 2
+           ELSE 3
+         END,
+         s.updated_at DESC NULLS LAST,
+         s.created_at DESC
+         LIMIT 1`,
+        [partnerId]
+      );
+      const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
+      const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+      const maxBranches = Number(sub?.max_branches ?? defaultBranches);
 
-    const countRes = await db.query('SELECT COUNT(*) FROM branches WHERE restaurant_id = $1', [partnerId]);
-    const currentBranches = parseInt(countRes.rows[0]?.count || '0', 10);
+      const countRes = await db.query('SELECT COUNT(*) FROM branches WHERE restaurant_id = $1', [partnerId]);
+      const currentBranches = parseInt(countRes.rows[0]?.count || '0', 10);
 
-    const newBranches = items.filter((i: any) => !i.id);
-    if (maxBranches < 9999 && (currentBranches + newBranches.length) > maxBranches) {
-      return res.status(403).json({
-        error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxBranches} units/branches. You have already created ${currentBranches} units. Please upgrade your plan to add more.`,
-        code: 'MAX_BRANCHES_EXCEEDED',
-        limit: maxBranches,
-        current: currentBranches,
-      });
-    }
-  }
-
-  if (table === 'restaurant_users') {
-    const sub = await first(
-      `SELECT s.*, p.max_users, p.name AS plan_name
-       FROM subscriptions s
-       LEFT JOIN subscription_plans p ON p.id = s.plan_id
-       WHERE s.partner_id = $1
-       ORDER BY CASE
-         WHEN s.status = 'active' THEN 1
-         WHEN s.status = 'trial' THEN 2
-         ELSE 3
-       END,
-       s.updated_at DESC NULLS LAST,
-       s.created_at DESC
-       LIMIT 1`,
-      [partnerId]
-    );
-    const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
-    const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
-    const maxUsers = Number(sub?.max_users ?? defaultUsers);
-
-    const countRes = await db.query('SELECT COUNT(*) FROM restaurant_users WHERE restaurant_id = $1', [partnerId]);
-    const currentUsers = parseInt(countRes.rows[0]?.count || '0', 10);
-
-    const newUsers = items.filter((i: any) => !i.id);
-    if (maxUsers < 9999 && (currentUsers + newUsers.length) > maxUsers) {
-      return res.status(403).json({
-        error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxUsers} users. You currently have ${currentUsers} team members. Please upgrade your plan to add more.`,
-        code: 'MAX_USERS_EXCEEDED',
-        limit: maxUsers,
-        current: currentUsers,
-      });
-    }
-  }
-
-  const inserted: any[] = [];
-
-  for (const rawItem of items) {
-    const item = { ...rawItem };
-    const id = item.id || randomUUID();
-    item.id = id;
-    if (table !== 'partners' && table !== 'restaurants') {
-      item.restaurant_id = partnerId;
-    }
-
-    const keys = Object.keys(item).filter(k => k !== 'category' && k !== 'unit' && k !== 'supplier' && k !== 'item' && k !== 'from_unit' && k !== 'to_unit' && k !== 'items');
-    const cols = keys.map(k => `"${k}"`).join(', ');
-    const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
-    const vals = keys.map(k => {
-      const v = item[k];
-      if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
-        return JSON.stringify(v);
+      const newBranches = items.filter((i: any) => !i.id);
+      if (maxBranches < 9999 && (currentBranches + newBranches.length) > maxBranches) {
+        return res.status(403).json({
+          error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxBranches} units/branches. You have already created ${currentBranches} units. Please upgrade your plan to add more.`,
+          code: 'MAX_BRANCHES_EXCEEDED',
+          limit: maxBranches,
+          current: currentBranches,
+        });
       }
-      return v;
-    });
+    }
 
-    const sql = `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON CONFLICT (id) DO UPDATE SET ${keys.map(k => `"${k}" = EXCLUDED."${k}"`).join(', ')} RETURNING *`;
-    const row = await first(sql, vals);
-    inserted.push(row);
+    if (table === 'restaurant_users') {
+      const sub = await first(
+        `SELECT s.*, p.max_users, p.name AS plan_name
+         FROM subscriptions s
+         LEFT JOIN subscription_plans p ON p.id = s.plan_id
+         WHERE s.partner_id = $1
+         ORDER BY CASE
+           WHEN s.status = 'active' THEN 1
+           WHEN s.status = 'trial' THEN 2
+           ELSE 3
+         END,
+         s.updated_at DESC NULLS LAST,
+         s.created_at DESC
+         LIMIT 1`,
+        [partnerId]
+      );
+      const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
+      const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+      const maxUsers = Number(sub?.max_users ?? defaultUsers);
+
+      const countRes = await db.query('SELECT COUNT(*) FROM restaurant_users WHERE restaurant_id = $1', [partnerId]);
+      const currentUsers = parseInt(countRes.rows[0]?.count || '0', 10);
+
+      const newUsers = items.filter((i: any) => !i.id);
+      if (maxUsers < 9999 && (currentUsers + newUsers.length) > maxUsers) {
+        return res.status(403).json({
+          error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxUsers} users. You currently have ${currentUsers} team members. Please upgrade your plan to add more.`,
+          code: 'MAX_USERS_EXCEEDED',
+          limit: maxUsers,
+          current: currentUsers,
+        });
+      }
+    }
+
+    const inserted: any[] = [];
+
+    for (const rawItem of items) {
+      const item = { ...rawItem };
+      const id = item.id || randomUUID();
+      item.id = id;
+      if (table !== 'partners' && table !== 'restaurants') {
+        item.restaurant_id = partnerId;
+      }
+
+      // Foreign key & empty string sanitization
+      if ('branch_id' in item && (!item.branch_id || item.branch_id === 'all' || !String(item.branch_id).trim())) {
+        item.branch_id = null;
+      }
+      if ('supplier_id' in item && (!item.supplier_id || !String(item.supplier_id).trim())) {
+        item.supplier_id = null;
+      }
+      if ('category_id' in item && (!item.category_id || !String(item.category_id).trim())) {
+        item.category_id = null;
+      }
+      if ('unit_id' in item && (!item.unit_id || !String(item.unit_id).trim())) {
+        item.unit_id = null;
+      }
+      if ('phone' in item && (!item.phone || !String(item.phone).trim())) {
+        item.phone = null;
+      }
+      if ('auth_user_id' in item && (!item.auth_user_id || !String(item.auth_user_id).trim())) {
+        item.auth_user_id = null;
+      }
+
+      const keys = Object.keys(item).filter(k => k !== 'category' && k !== 'unit' && k !== 'supplier' && k !== 'item' && k !== 'from_unit' && k !== 'to_unit' && k !== 'items');
+      const cols = keys.map(k => `"${k}"`).join(', ');
+      const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+      const vals = keys.map(k => {
+        const v = item[k];
+        if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
+          return JSON.stringify(v);
+        }
+        return v;
+      });
+
+      const sql = `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON CONFLICT (id) DO UPDATE SET ${keys.map(k => `"${k}" = EXCLUDED."${k}"`).join(', ')} RETURNING *`;
+      const row = await first(sql, vals);
+      inserted.push(row);
+    }
+
+    return res.status(201).json({ data: Array.isArray(req.body) ? inserted : inserted[0] });
+  } catch (err: any) {
+    console.error(`Error in POST /api/resto/${table}:`, err);
+    return res.status(500).json({ error: err?.message || 'Database error occurred while creating record' });
   }
-
-  return res.status(201).json({ data: Array.isArray(req.body) ? inserted : inserted[0] });
 });
 
 app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -2123,43 +2148,65 @@ app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, re
   const id = (req.query.id || req.body?.id) as string;
   if (!id) return res.status(400).json({ error: 'ID is required for update' });
 
-  if (table === 'restaurants') {
-    const { name, legal_name, phone, address, city } = req.body || {};
-    const updated = await first(
-      `UPDATE partners SET restaurant_name = COALESCE($1, restaurant_name), business_name = COALESCE($2, business_name), phone = COALESCE($3, phone), city = COALESCE($4, city), updated_at = NOW() WHERE id = $5 RETURNING *`,
-      [name, legal_name, phone, city || address, partnerId]
-    );
-    return res.json({ data: updated });
-  }
-
-  const item = { ...req.body };
-  delete item.id;
-  delete item.restaurant_id;
-  delete item.category;
-  delete item.unit;
-  delete item.supplier;
-  delete item.item;
-  delete item.from_unit;
-  delete item.to_unit;
-  delete item.items;
-
-  const keys = Object.keys(item);
-  if (keys.length === 0) return res.json({ data: null });
-
-  const setClauses = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');
-  const vals = keys.map(k => {
-    const v = item[k];
-    if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
-      return JSON.stringify(v);
+  try {
+    if (table === 'restaurants') {
+      const { name, legal_name, phone, address, city } = req.body || {};
+      const updated = await first(
+        `UPDATE partners SET restaurant_name = COALESCE($1, restaurant_name), business_name = COALESCE($2, business_name), phone = COALESCE($3, phone), city = COALESCE($4, city), updated_at = NOW() WHERE id = $5 RETURNING *`,
+        [name, legal_name, phone, city || address, partnerId]
+      );
+      return res.json({ data: updated });
     }
-    return v;
-  });
-  vals.push(id);
-  vals.push(partnerId);
 
-  const sql = `UPDATE ${table} SET ${setClauses} WHERE id = $${vals.length - 1} AND restaurant_id = $${vals.length} RETURNING *`;
-  const updated = await first(sql, vals);
-  return res.json({ data: updated });
+    const item = { ...req.body };
+    delete item.id;
+    delete item.restaurant_id;
+    delete item.category;
+    delete item.unit;
+    delete item.supplier;
+    delete item.item;
+    delete item.from_unit;
+    delete item.to_unit;
+    delete item.items;
+
+    // Foreign key & empty string sanitization
+    if ('branch_id' in item && (!item.branch_id || item.branch_id === 'all' || !String(item.branch_id).trim())) {
+      item.branch_id = null;
+    }
+    if ('supplier_id' in item && (!item.supplier_id || !String(item.supplier_id).trim())) {
+      item.supplier_id = null;
+    }
+    if ('category_id' in item && (!item.category_id || !String(item.category_id).trim())) {
+      item.category_id = null;
+    }
+    if ('unit_id' in item && (!item.unit_id || !String(item.unit_id).trim())) {
+      item.unit_id = null;
+    }
+    if ('phone' in item && (!item.phone || !String(item.phone).trim())) {
+      item.phone = null;
+    }
+
+    const keys = Object.keys(item);
+    if (keys.length === 0) return res.json({ data: null });
+
+    const setClauses = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');
+    const vals = keys.map(k => {
+      const v = item[k];
+      if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
+        return JSON.stringify(v);
+      }
+      return v;
+    });
+    vals.push(id);
+    vals.push(partnerId);
+
+    const sql = `UPDATE ${table} SET ${setClauses} WHERE id = $${vals.length - 1} AND restaurant_id = $${vals.length} RETURNING *`;
+    const updated = await first(sql, vals);
+    return res.json({ data: updated });
+  } catch (err: any) {
+    console.error(`Error in PATCH /api/resto/${table}:`, err);
+    return res.status(500).json({ error: err?.message || 'Database error occurred while updating record' });
+  }
 });
 
 app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -2173,8 +2220,13 @@ app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, r
   const id = (req.query.id || req.body?.id) as string;
   if (!id) return res.status(400).json({ error: 'ID is required for delete' });
 
-  await db.query(`DELETE FROM ${table} WHERE id = $1 AND restaurant_id = $2`, [id, partnerId]);
-  return res.status(200).json({ success: true });
+  try {
+    await db.query(`DELETE FROM ${table} WHERE id = $1 AND restaurant_id = $2`, [id, partnerId]);
+    return res.status(200).json({ success: true });
+  } catch (err: any) {
+    console.error(`Error in DELETE /api/resto/${table}:`, err);
+    return res.status(500).json({ error: err?.message || 'Database error occurred while deleting record' });
+  }
 });
 
 initDatabase().then(() => {
