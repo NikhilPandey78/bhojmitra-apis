@@ -143,7 +143,7 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
     const ssoRow = (
       await client.query(
         `SELECT sso.*, p.owner_name, p.restaurant_name, p.email, p.phone, p.status AS partner_status,
-                p.restaurant_type, p.city, p.number_of_branches, p.onboarding_completed
+                p.restaurant_type, p.city, p.business_name, p.gst_number, p.business_type, p.number_of_branches, p.onboarding_completed
          FROM sso_authorization_codes sso
          JOIN partners p ON p.id = sso.partner_id
          WHERE sso.code_hash = $1
@@ -163,9 +163,11 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
     await client.query('UPDATE sso_authorization_codes SET used_at = NOW() WHERE id = $1', [ssoRow.id]);
     await client.query('COMMIT');
 
+    await expireSubscriptions(ssoRow.partner_id);
+
     const sub = (
       await db.query(
-        `SELECT s.*, p.name AS plan_name, p.max_users, p.max_branches
+        `SELECT s.*, p.name AS plan_name, p.price, p.billing_cycle AS plan_billing_cycle, p.max_users, p.max_branches
          FROM subscriptions s
          LEFT JOIN subscription_plans p ON p.id = s.plan_id
          WHERE s.partner_id = $1
@@ -192,7 +194,7 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
 
     const subscriptionPlan = (sub?.plan_name || sub?.plan || 'trial').toLowerCase();
     const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
-    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 4;
+    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
 
     return res.json({
       success: true,
@@ -207,7 +209,7 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
       restaurant: {
         id: ssoRow.partner_id,
         name: ssoRow.restaurant_name,
-        legal_name: ssoRow.restaurant_name,
+        legal_name: ssoRow.business_name || ssoRow.restaurant_name,
         email: ssoRow.email,
         phone: ssoRow.phone || null,
         address: ssoRow.city || '',
@@ -233,22 +235,24 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
         status: 'active',
         created_at: ssoRow.created_at,
       },
-      subscription: {
-        id: ssoRow.subscription_id || ssoRow.partner_id,
-        restaurant_id: ssoRow.partner_id,
-        plan: ssoRow.subscription_plan || 'trial',
-        status: ssoRow.subscription_status || 'trial',
-        start_date: ssoRow.start_date ? new Date(ssoRow.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
-        expiry_date: ssoRow.expiry_date ? new Date(ssoRow.expiry_date).toISOString().slice(0, 10) : new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10),
-        billing_cycle: ssoRow.billing_cycle || 'monthly',
-        amount: Number(ssoRow.amount || 0),
-        currency: 'INR',
-        auto_renewal: Boolean(ssoRow.auto_renew),
-        max_branches: ssoRow.max_branches ?? defaultBranches,
-        max_users: ssoRow.max_users ?? defaultUsers,
-        created_at: ssoRow.created_at,
-        updated_at: ssoRow.created_at,
-      },
+      subscription: sub
+        ? {
+            id: sub.id,
+            restaurant_id: ssoRow.partner_id,
+            plan: (sub.plan_name || sub.plan || 'trial').toLowerCase(),
+            status: sub.status || 'trial',
+            start_date: sub.start_date ? new Date(sub.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
+            expiry_date: sub.expiry_date ? new Date(sub.expiry_date).toISOString().slice(0, 10) : null,
+            billing_cycle: sub.billing_cycle || sub.plan_billing_cycle || 'monthly',
+            amount: Number(sub.price ?? sub.amount ?? 0),
+            currency: 'INR',
+            auto_renewal: Boolean(sub.auto_renew),
+            max_branches: sub.max_branches ?? defaultBranches,
+            max_users: sub.max_users ?? defaultUsers,
+            created_at: sub.created_at,
+            updated_at: sub.updated_at || sub.created_at,
+          }
+        : null,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -258,30 +262,53 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
   }
 });
 
-app.get('/api/auth/sso/me', async (req, res) => {
+async function handleProfileRequest(req: express.Request, res: express.Response) {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
   if (!token) return res.status(401).json({ error: 'Bearer token is required.' });
 
   try {
     const payload = jwt.verify(token, config.jwtSecret) as { sub?: string; app?: string };
-    if (!payload.sub || payload.app !== 'myresto') {
-      return res.status(401).json({ error: 'Invalid SSO session token.' });
+    if (!payload.sub) {
+      return res.status(401).json({ error: 'Invalid session token.' });
     }
+
+    await expireSubscriptions(payload.sub);
 
     const partner = await first('SELECT * FROM partners WHERE id=$1', [payload.sub]);
     if (!partner) return res.status(404).json({ error: 'Partner profile not found.' });
 
     const sub = await first(
-      `SELECT s.*, sp.max_users, sp.max_branches
+      `SELECT s.*, sp.name AS plan_name, sp.price, sp.billing_cycle AS plan_billing_cycle, sp.max_users, sp.max_branches
        FROM subscriptions s
        LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
-       WHERE s.partner_id=$1`,
+       WHERE s.partner_id=$1
+       ORDER BY s.created_at DESC
+       LIMIT 1`,
       [payload.sub]
     );
 
-    const subscriptionPlan = (sub?.plan || 'trial').toLowerCase();
+    const subscriptionPlan = (sub?.plan_name || sub?.plan || 'trial').toLowerCase();
     const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
-    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 4;
+    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
+
+    const subscriptionObj = sub
+      ? {
+          id: sub.id,
+          restaurant_id: partner.id,
+          plan: (sub.plan_name || sub.plan || 'trial').toLowerCase(),
+          status: sub.status || 'trial',
+          start_date: sub.start_date ? new Date(sub.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
+          expiry_date: sub.expiry_date ? new Date(sub.expiry_date).toISOString().slice(0, 10) : null,
+          billing_cycle: sub.billing_cycle || sub.plan_billing_cycle || 'monthly',
+          amount: Number(sub.price ?? sub.amount ?? 0),
+          currency: 'INR',
+          auto_renewal: Boolean(sub.auto_renew),
+          max_branches: sub.max_branches ?? defaultBranches,
+          max_users: sub.max_users ?? defaultUsers,
+          created_at: sub.created_at,
+          updated_at: sub.updated_at || sub.created_at,
+        }
+      : null;
 
     return res.json({
       success: true,
@@ -295,7 +322,7 @@ app.get('/api/auth/sso/me', async (req, res) => {
       restaurant: {
         id: partner.id,
         name: partner.restaurant_name,
-        legal_name: partner.restaurant_name,
+        legal_name: partner.business_name || partner.restaurant_name,
         email: partner.email,
         phone: partner.phone || null,
         city: partner.city || '',
@@ -312,27 +339,16 @@ app.get('/api/auth/sso/me', async (req, res) => {
         role: 'owner',
         status: 'active',
       },
-      subscription: sub
-        ? {
-            id: sub.id,
-            restaurant_id: partner.id,
-            plan: sub.plan,
-            status: sub.status,
-            start_date: sub.start_date ? new Date(sub.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
-            expiry_date: sub.expiry_date ? new Date(sub.expiry_date).toISOString().slice(0, 10) : new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10),
-            billing_cycle: sub.billing_cycle || 'monthly',
-            amount: Number(sub.amount || 0),
-            currency: 'INR',
-            auto_renewal: Boolean(sub.auto_renew),
-            max_branches: sub.max_branches ?? defaultBranches,
-            max_users: sub.max_users ?? defaultUsers,
-          }
-        : null,
+      subscription: subscriptionObj,
     });
   } catch {
     return res.status(401).json({ error: 'Invalid or expired session token.' });
   }
-});
+}
+
+app.get('/api/auth/sso/me', handleProfileRequest);
+app.get('/api/auth/me', handleProfileRequest);
+app.get('/auth/me', handleProfileRequest);
 
 app.use('/api', requireAuth);
 
@@ -1659,8 +1675,49 @@ app.post('/api/onboarding/complete', requireAuth, async (req: AuthenticatedReque
     return res.status(500).json({ error: 'Unable to complete onboarding. Please try again.' });
   }
 });
-app.get('/api/dashboard', requireAuth, async (req: AuthenticatedRequest,res) => { const id=req.userId; const [partner,subscription,invoices,tickets,notifications]=await Promise.all([first('SELECT * FROM partners WHERE id=$1',[id]),first('SELECT * FROM subscriptions WHERE partner_id=$1',[id]),db.query('SELECT * FROM invoices WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id]),db.query('SELECT * FROM support_tickets WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id]),db.query('SELECT * FROM notifications WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5',[id])]); res.json({partner,subscription,invoices:invoices.rows,tickets:tickets.rows,notifications:notifications.rows}); });
-app.get('/api/subscription', requireAuth, async(req:AuthenticatedRequest,res)=>res.json({subscription:await first('SELECT * FROM subscriptions WHERE partner_id=$1',[req.userId])}));
+app.get('/api/dashboard', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const id = req.userId;
+  if (!id) return res.status(401).json({ error: 'Unauthorized' });
+  await expireSubscriptions(id);
+  const [partner, subscription, invoices, tickets, notifications] = await Promise.all([
+    first('SELECT * FROM partners WHERE id=$1', [id]),
+    first(
+      `SELECT s.*, p.name AS plan_name, p.price, p.billing_cycle AS plan_billing_cycle, p.max_users, p.max_branches, p.features
+       FROM subscriptions s
+       LEFT JOIN subscription_plans p ON p.id = s.plan_id
+       WHERE s.partner_id = $1
+       ORDER BY s.created_at DESC
+       LIMIT 1`,
+      [id]
+    ),
+    db.query('SELECT * FROM invoices WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5', [id]),
+    db.query('SELECT * FROM support_tickets WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5', [id]),
+    db.query('SELECT * FROM notifications WHERE partner_id=$1 ORDER BY created_at DESC LIMIT 5', [id]),
+  ]);
+  res.json({
+    partner,
+    subscription,
+    invoices: invoices.rows,
+    tickets: tickets.rows,
+    notifications: notifications.rows,
+  });
+});
+
+app.get('/api/subscription', requireAuth, async (req: AuthenticatedRequest, res) => {
+  if (!req.userId) return res.status(401).json({ error: 'Unauthorized' });
+  await expireSubscriptions(req.userId);
+  const sub = await first(
+    `SELECT s.*, p.name AS plan_name, p.price, p.billing_cycle AS plan_billing_cycle, p.max_users, p.max_branches, p.features
+     FROM subscriptions s
+     LEFT JOIN subscription_plans p ON p.id = s.plan_id
+     WHERE s.partner_id = $1
+     ORDER BY s.created_at DESC
+     LIMIT 1`,
+    [req.userId]
+  );
+  res.json({ subscription: sub });
+});
+
 app.patch('/api/subscription', requireAuth, async (req: AuthenticatedRequest, res) => {
   return res.status(403).json({
     success: false,
@@ -1668,15 +1725,329 @@ app.patch('/api/subscription', requireAuth, async (req: AuthenticatedRequest, re
   });
 });
 
-app.get('/api/invoices', requireAuth, async(req:AuthenticatedRequest,res)=>res.json({invoices:(await db.query('SELECT * FROM invoices WHERE partner_id=$1 ORDER BY created_at DESC',[req.userId])).rows}));
-app.get('/api/notifications', requireAuth, async(req:AuthenticatedRequest,res)=>res.json({notifications:(await db.query('SELECT * FROM notifications WHERE partner_id=$1 ORDER BY created_at DESC',[req.userId])).rows}));
-app.patch('/api/notifications/:id/read', requireAuth, async(req:AuthenticatedRequest,res)=>{await db.query('UPDATE notifications SET is_read=TRUE WHERE id=$1 AND partner_id=$2',[req.params.id,req.userId]);res.json({ok:true});});
-app.delete('/api/notifications/:id', requireAuth, async(req:AuthenticatedRequest,res)=>{await db.query('DELETE FROM notifications WHERE id=$1 AND partner_id=$2',[req.params.id,req.userId]);res.status(204).send();});
-app.get('/api/documents', requireAuth, async(req:AuthenticatedRequest,res)=>res.json({documents:(await db.query('SELECT * FROM documents WHERE partner_id=$1 ORDER BY created_at DESC',[req.userId])).rows}));
-app.post('/api/documents', requireAuth, async(req:AuthenticatedRequest,res)=>{const {file_name,file_type,document_type}=req.body;if(!file_name||!document_type)return res.status(400).json({error:'file_name and document_type are required.'});const document=await first('INSERT INTO documents (id,partner_id,file_name,file_type,document_type) VALUES ($1,$2,$3,$4,$5) RETURNING *',[randomUUID(),req.userId,file_name,file_type,document_type]);res.status(201).json({document});});
-app.delete('/api/documents/:id', requireAuth, async(req:AuthenticatedRequest,res)=>{await db.query('DELETE FROM documents WHERE id=$1 AND partner_id=$2',[req.params.id,req.userId]);res.status(204).send();});
-app.get('/api/support/tickets', requireAuth, async(req:AuthenticatedRequest,res)=>res.json({tickets:(await db.query('SELECT * FROM support_tickets WHERE partner_id=$1 ORDER BY created_at DESC',[req.userId])).rows}));
-app.post('/api/support/tickets', requireAuth, async(req:AuthenticatedRequest,res)=>{const parsed=ticketSchema.safeParse(req.body);if(!parsed.success)return res.status(400).json({error:'Invalid ticket.'});const t=parsed.data;const ticket=await first('INSERT INTO support_tickets (id,partner_id,ticket_number,subject,category,priority,message) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',[randomUUID(),req.userId,referenceId('TKT'),t.subject,t.category,t.priority,t.message]);res.status(201).json({ticket});});
+app.get('/api/invoices', requireAuth, async (req: AuthenticatedRequest, res) => res.json({ invoices: (await db.query('SELECT * FROM invoices WHERE partner_id=$1 ORDER BY created_at DESC', [req.userId])).rows }));
+app.get('/api/notifications', requireAuth, async (req: AuthenticatedRequest, res) => res.json({ notifications: (await db.query('SELECT * FROM notifications WHERE partner_id=$1 ORDER BY created_at DESC', [req.userId])).rows }));
+app.patch('/api/notifications/:id/read', requireAuth, async (req: AuthenticatedRequest, res) => {
+  await db.query('UPDATE notifications SET is_read=TRUE WHERE id=$1 AND partner_id=$2', [req.params.id, req.userId]);
+  res.json({ ok: true });
+});
+app.delete('/api/notifications/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  await db.query('DELETE FROM notifications WHERE id=$1 AND partner_id=$2', [req.params.id, req.userId]);
+  res.status(204).send();
+});
+app.get('/api/documents', requireAuth, async (req: AuthenticatedRequest, res) => res.json({ documents: (await db.query('SELECT * FROM documents WHERE partner_id=$1 ORDER BY created_at DESC', [req.userId])).rows }));
+app.post('/api/documents', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const { file_name, file_type, document_type } = req.body;
+  if (!file_name || !document_type) return res.status(400).json({ error: 'file_name and document_type are required.' });
+  const document = await first('INSERT INTO documents (id,partner_id,file_name,file_type,document_type) VALUES ($1,$2,$3,$4,$5) RETURNING *', [randomUUID(), req.userId, file_name, file_type, document_type]);
+  res.status(201).json({ document });
+});
+app.delete('/api/documents/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  await db.query('DELETE FROM documents WHERE id=$1 AND partner_id=$2', [req.params.id, req.userId]);
+  res.status(204).send();
+});
+app.get('/api/support/tickets', requireAuth, async (req: AuthenticatedRequest, res) => res.json({ tickets: (await db.query('SELECT * FROM support_tickets WHERE partner_id=$1 ORDER BY created_at DESC', [req.userId])).rows }));
+app.post('/api/support/tickets', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const parsed = ticketSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid ticket.' });
+  const t = parsed.data;
+  const ticket = await first('INSERT INTO support_tickets (id,partner_id,ticket_number,subject,category,priority,message) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [randomUUID(), req.userId, referenceId('TKT'), t.subject, t.category, t.priority, t.message]);
+  res.status(201).json({ ticket });
+});
+
+app.get('/api/ticket_replies', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const ticketId = req.query.ticket_id as string;
+  if (!ticketId) return res.status(400).json({ error: 'ticket_id is required' });
+  const ticket = await first('SELECT id FROM support_tickets WHERE id=$1 AND partner_id=$2', [ticketId, req.userId]);
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found.' });
+  const replies = await db.query('SELECT * FROM ticket_replies WHERE ticket_id=$1 ORDER BY created_at ASC', [ticketId]);
+  res.json({ replies: replies.rows });
+});
+
+app.post('/api/ticket_replies', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const { ticket_id, message, attachment_url } = req.body;
+  if (!ticket_id || !message?.trim()) return res.status(400).json({ error: 'ticket_id and message are required.' });
+  const ticket = await first('SELECT id FROM support_tickets WHERE id=$1 AND partner_id=$2', [ticket_id, req.userId]);
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found.' });
+  const reply = await first(
+    'INSERT INTO ticket_replies (id, ticket_id, sender_type, message, attachment_url) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+    [randomUUID(), ticket_id, 'customer', message.trim(), attachment_url || null]
+  );
+  res.status(201).json({ reply });
+});
+
+// ============================================================
+// RESTAURANT INVENTORY & MANAGEMENT API (100% TENANT ISOLATED)
+// ============================================================
+const ALLOWED_RESTO_TABLES = new Set([
+  'branches',
+  'restaurant_users',
+  'categories',
+  'units',
+  'unit_conversions',
+  'suppliers',
+  'inventory_items',
+  'stock_transactions',
+  'purchase_orders',
+  'purchase_order_items',
+  'stock_receipts',
+  'stock_receipt_items',
+  'purchase_returns',
+  'purchase_return_items',
+  'stock_issues',
+  'stock_transfers',
+  'stock_transfer_items',
+  'stock_adjustments',
+  'stock_adjustment_items',
+  'stock_counts',
+  'stock_count_items',
+  'kitchen_requisitions',
+  'kitchen_requisition_items',
+  'recipes',
+  'recipe_ingredients',
+  'menu_items',
+  'wastage_records',
+  'activity_logs',
+  'restaurants',
+  'subscriptions',
+  'notifications',
+]);
+
+app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const table = String(req.params.table || '');
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+  if (!ALLOWED_RESTO_TABLES.has(table)) {
+    return res.status(400).json({ error: `Unknown resource: ${table}` });
+  }
+
+  if (table === 'restaurants') {
+    const partner = await first('SELECT * FROM partners WHERE id = $1', [partnerId]);
+    if (!partner) return res.json({ data: [] });
+    const rest = {
+      id: partner.id,
+      name: partner.restaurant_name,
+      legal_name: partner.business_name || partner.restaurant_name,
+      gst_number: partner.gst_number || null,
+      phone: partner.phone || null,
+      email: partner.email,
+      address: partner.city || '',
+      city: partner.city || '',
+      state: '',
+      postal_code: '',
+      country: 'India',
+      currency: 'INR',
+      logo_url: null,
+      status: 'active',
+      created_at: partner.created_at,
+      updated_at: partner.updated_at,
+    };
+    return res.json({ data: [rest] });
+  }
+
+  if (table === 'subscriptions') {
+    await expireSubscriptions(partnerId);
+    const sub = await first(
+      `SELECT s.*, sp.name AS plan_name, sp.price, sp.billing_cycle AS plan_billing_cycle, sp.max_users, sp.max_branches
+       FROM subscriptions s
+       LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
+       WHERE s.partner_id = $1
+       ORDER BY s.created_at DESC
+       LIMIT 1`,
+      [partnerId]
+    );
+    if (!sub) return res.json({ data: [] });
+    const planName = (sub.plan_name || sub.plan || 'trial').toLowerCase();
+    const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const mappedSub = {
+      id: sub.id,
+      restaurant_id: partnerId,
+      plan: planName,
+      status: sub.status || 'trial',
+      start_date: sub.start_date ? new Date(sub.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
+      expiry_date: sub.expiry_date ? new Date(sub.expiry_date).toISOString().slice(0, 10) : null,
+      billing_cycle: sub.billing_cycle || sub.plan_billing_cycle || 'monthly',
+      amount: Number(sub.price ?? sub.amount ?? 0),
+      currency: 'INR',
+      auto_renewal: Boolean(sub.auto_renew),
+      max_branches: sub.max_branches ?? defaultBranches,
+      max_users: sub.max_users ?? defaultUsers,
+      created_at: sub.created_at,
+      updated_at: sub.updated_at || sub.created_at,
+    };
+    return res.json({ data: [mappedSub] });
+  }
+
+  const values: any[] = [partnerId];
+  let whereClause = `WHERE restaurant_id = $1`;
+
+  const validColRegex = /^[a-z0-9_]+$/i;
+  for (const [key, val] of Object.entries(req.query)) {
+    if (['order', 'limit', 'select', 'offset'].includes(key)) continue;
+    if (key === 'restaurant_id') continue;
+    if (validColRegex.test(key) && val !== undefined) {
+      values.push(val);
+      whereClause += ` AND ${key} = $${values.length}`;
+    }
+  }
+
+  let orderClause = '';
+  if (typeof req.query.order === 'string') {
+    const parts = req.query.order.split('.');
+    const col = parts[0];
+    const dir = parts[1]?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    if (validColRegex.test(col)) {
+      orderClause = ` ORDER BY ${col} ${dir}`;
+    }
+  } else {
+    orderClause = ` ORDER BY created_at DESC`;
+  }
+
+  let limitClause = '';
+  if (req.query.limit && !isNaN(Number(req.query.limit))) {
+    limitClause = ` LIMIT ${Math.min(1000, Number(req.query.limit))}`;
+  }
+
+  const querySql = `SELECT * FROM ${table} ${whereClause}${orderClause}${limitClause}`;
+  const result = await db.query(querySql, values);
+  const rows = result.rows;
+
+  if (table === 'inventory_items' && rows.length > 0) {
+    const [cats, units, supps] = await Promise.all([
+      db.query('SELECT * FROM categories WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM units WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const catMap = Object.fromEntries(cats.rows.map(c => [c.id, c]));
+    const unitMap = Object.fromEntries(units.rows.map(u => [u.id, u]));
+    const suppMap = Object.fromEntries(supps.rows.map(s => [s.id, s]));
+    for (const row of rows) {
+      row.category = catMap[row.category_id] || null;
+      row.unit = unitMap[row.unit_id] || null;
+      row.supplier = suppMap[row.supplier_id] || null;
+    }
+  } else if (table === 'stock_transactions' && rows.length > 0) {
+    const items = await db.query('SELECT * FROM inventory_items WHERE restaurant_id = $1', [partnerId]);
+    const itemMap = Object.fromEntries(items.rows.map(i => [i.id, i]));
+    for (const row of rows) {
+      row.item = itemMap[row.item_id] || null;
+    }
+  } else if ((table === 'stock_receipts' || table === 'purchase_orders' || table === 'purchase_returns') && rows.length > 0) {
+    const supps = await db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]);
+    const suppMap = Object.fromEntries(supps.rows.map(s => [s.id, s]));
+    for (const row of rows) {
+      row.supplier = suppMap[row.supplier_id] || null;
+    }
+  } else if (table === 'wastage_records' && rows.length > 0) {
+    const items = await db.query('SELECT * FROM inventory_items WHERE restaurant_id = $1', [partnerId]);
+    const itemMap = Object.fromEntries(items.rows.map(i => [i.id, i]));
+    for (const row of rows) {
+      row.item = itemMap[row.item_id] || null;
+    }
+  } else if (table === 'unit_conversions' && rows.length > 0) {
+    const units = await db.query('SELECT * FROM units WHERE restaurant_id = $1', [partnerId]);
+    const unitMap = Object.fromEntries(units.rows.map(u => [u.id, u]));
+    for (const row of rows) {
+      row.from_unit = unitMap[row.from_unit_id] || null;
+      row.to_unit = unitMap[row.to_unit_id] || null;
+    }
+  }
+
+  return res.json({ data: rows });
+});
+
+app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const table = String(req.params.table || '');
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+  if (!ALLOWED_RESTO_TABLES.has(table)) {
+    return res.status(400).json({ error: `Unknown resource: ${table}` });
+  }
+
+  const items = Array.isArray(req.body) ? req.body : [req.body];
+  const inserted: any[] = [];
+
+  for (const rawItem of items) {
+    const item = { ...rawItem };
+    const id = item.id || randomUUID();
+    item.id = id;
+    if (table !== 'partners' && table !== 'restaurants') {
+      item.restaurant_id = partnerId;
+    }
+
+    const keys = Object.keys(item).filter(k => k !== 'category' && k !== 'unit' && k !== 'supplier' && k !== 'item' && k !== 'from_unit' && k !== 'to_unit' && k !== 'items');
+    const cols = keys.map(k => `"${k}"`).join(', ');
+    const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+    const vals = keys.map(k => item[k]);
+
+    const sql = `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON CONFLICT (id) DO UPDATE SET ${keys.map(k => `"${k}" = EXCLUDED."${k}"`).join(', ')} RETURNING *`;
+    const row = await first(sql, vals);
+    inserted.push(row);
+  }
+
+  return res.status(201).json({ data: Array.isArray(req.body) ? inserted : inserted[0] });
+});
+
+app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const table = String(req.params.table || '');
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+  if (!ALLOWED_RESTO_TABLES.has(table)) {
+    return res.status(400).json({ error: `Unknown resource: ${table}` });
+  }
+
+  const id = (req.query.id || req.body?.id) as string;
+  if (!id) return res.status(400).json({ error: 'ID is required for update' });
+
+  if (table === 'restaurants') {
+    const { name, legal_name, phone, address, city } = req.body || {};
+    const updated = await first(
+      `UPDATE partners SET restaurant_name = COALESCE($1, restaurant_name), business_name = COALESCE($2, business_name), phone = COALESCE($3, phone), city = COALESCE($4, city), updated_at = NOW() WHERE id = $5 RETURNING *`,
+      [name, legal_name, phone, city || address, partnerId]
+    );
+    return res.json({ data: updated });
+  }
+
+  const item = { ...req.body };
+  delete item.id;
+  delete item.restaurant_id;
+  delete item.category;
+  delete item.unit;
+  delete item.supplier;
+  delete item.item;
+  delete item.from_unit;
+  delete item.to_unit;
+  delete item.items;
+
+  const keys = Object.keys(item);
+  if (keys.length === 0) return res.json({ data: null });
+
+  const setClauses = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');
+  const vals = keys.map(k => item[k]);
+  vals.push(id);
+  vals.push(partnerId);
+
+  const sql = `UPDATE ${table} SET ${setClauses} WHERE id = $${vals.length - 1} AND restaurant_id = $${vals.length} RETURNING *`;
+  const updated = await first(sql, vals);
+  return res.json({ data: updated });
+});
+
+app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const table = String(req.params.table || '');
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+  if (!ALLOWED_RESTO_TABLES.has(table)) {
+    return res.status(400).json({ error: `Unknown resource: ${table}` });
+  }
+
+  const id = (req.query.id || req.body?.id) as string;
+  if (!id) return res.status(400).json({ error: 'ID is required for delete' });
+
+  await db.query(`DELETE FROM ${table} WHERE id = $1 AND restaurant_id = $2`, [id, partnerId]);
+  return res.status(200).json({ success: true });
+});
+
 initDatabase().then(() => {
 	app.listen(config.port, () => console.log(`BhojMitra backend listening on http://localhost:${config.port}`));
 }).catch((error) => {
