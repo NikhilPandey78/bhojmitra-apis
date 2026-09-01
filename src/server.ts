@@ -143,14 +143,9 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
     const ssoRow = (
       await client.query(
         `SELECT sso.*, p.owner_name, p.restaurant_name, p.email, p.phone, p.status AS partner_status,
-                p.restaurant_type, p.city, p.number_of_branches, p.onboarding_completed,
-                s.id AS subscription_id, s.plan AS subscription_plan, s.status AS subscription_status,
-                s.start_date, s.expiry_date, s.billing_cycle, s.auto_renew, s.amount,
-                sp.max_users, sp.max_branches
+                p.restaurant_type, p.city, p.number_of_branches, p.onboarding_completed
          FROM sso_authorization_codes sso
          JOIN partners p ON p.id = sso.partner_id
-         LEFT JOIN subscriptions s ON s.partner_id = p.id
-         LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
          WHERE sso.code_hash = $1
            AND sso.target_app = 'myresto'
            AND sso.used_at IS NULL
@@ -168,6 +163,18 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
     await client.query('UPDATE sso_authorization_codes SET used_at = NOW() WHERE id = $1', [ssoRow.id]);
     await client.query('COMMIT');
 
+    const sub = (
+      await db.query(
+        `SELECT s.*, p.name AS plan_name, p.max_users, p.max_branches
+         FROM subscriptions s
+         LEFT JOIN subscription_plans p ON p.id = s.plan_id
+         WHERE s.partner_id = $1
+         ORDER BY s.created_at DESC
+         LIMIT 1`,
+        [ssoRow.partner_id]
+      )
+    ).rows[0];
+
     const token = jwt.sign(
       {
         sub: ssoRow.partner_id,
@@ -183,7 +190,7 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    const subscriptionPlan = (ssoRow.subscription_plan || 'trial').toLowerCase();
+    const subscriptionPlan = (sub?.plan_name || sub?.plan || 'trial').toLowerCase();
     const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
     const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 4;
 
@@ -334,20 +341,27 @@ app.post('/api/auth/my-resto-sso', async (req: AuthenticatedRequest, res) => {
   const partner = await first('SELECT * FROM partners WHERE id=$1', [req.userId]);
   if (!partner) return res.status(404).json({ error: 'Partner profile not found.' });
 
-  if (!partner.onboarding_completed) {
-    return res.status(403).json({
-      error: 'Please complete onboarding before accessing My Restaurant.',
-      code: 'ONBOARDING_REQUIRED',
-    });
-  }
-
   await expireSubscriptions(req.userId);
-  const subscription = await first('SELECT * FROM subscriptions WHERE partner_id=$1', [req.userId]);
-  if (!subscription || !ACCESSIBLE_SUBSCRIPTION_STATUSES.has(subscription.status)) {
+  const subscription = await first(
+    `SELECT s.*, p.name AS plan_name, p.max_users, p.max_branches
+     FROM subscriptions s
+     LEFT JOIN subscription_plans p ON p.id = s.plan_id
+     WHERE s.partner_id = $1
+     ORDER BY s.created_at DESC
+     LIMIT 1`,
+    [req.userId]
+  );
+
+  const subStatus = (subscription?.status || partner?.status || 'trial').toLowerCase();
+  if (subStatus === 'expired' || subStatus === 'cancelled') {
     return res.status(403).json({
       error: 'Your subscription is expired or inactive. Please renew to access your restaurant.',
       code: 'SUBSCRIPTION_INACTIVE',
     });
+  }
+
+  if (!partner.onboarding_completed && partner.restaurant_name) {
+    await db.query("UPDATE partners SET onboarding_completed = TRUE, onboarding_status = 'completed', updated_at = NOW() WHERE id = $1", [req.userId]);
   }
 
   const rawCode = randomBytes(32).toString('hex');
