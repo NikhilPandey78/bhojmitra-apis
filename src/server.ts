@@ -171,7 +171,13 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
          FROM subscriptions s
          LEFT JOIN subscription_plans p ON p.id = s.plan_id
          WHERE s.partner_id = $1
-         ORDER BY s.created_at DESC
+         ORDER BY CASE
+           WHEN s.status = 'active' THEN 1
+           WHEN s.status = 'trial' THEN 2
+           ELSE 3
+         END,
+         s.updated_at DESC NULLS LAST,
+         s.created_at DESC
          LIMIT 1`,
         [ssoRow.partner_id]
       )
@@ -192,7 +198,7 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    const subscriptionPlan = (sub?.plan_name || sub?.plan || 'trial').toLowerCase();
+    const subscriptionPlan = sub ? (sub.plan_name || sub.plan || 'basic').toLowerCase() : null;
     const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
     const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
 
@@ -239,8 +245,8 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
         ? {
             id: sub.id,
             restaurant_id: ssoRow.partner_id,
-            plan: (sub.plan_name || sub.plan || 'trial').toLowerCase(),
-            status: sub.status || 'trial',
+            plan: subscriptionPlan,
+            status: sub.status || 'active',
             start_date: sub.start_date ? new Date(sub.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
             expiry_date: sub.expiry_date ? new Date(sub.expiry_date).toISOString().slice(0, 10) : null,
             billing_cycle: sub.billing_cycle || sub.plan_billing_cycle || 'monthly',
@@ -282,12 +288,18 @@ async function handleProfileRequest(req: express.Request, res: express.Response)
        FROM subscriptions s
        LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
        WHERE s.partner_id=$1
-       ORDER BY s.created_at DESC
+       ORDER BY CASE
+         WHEN s.status = 'active' THEN 1
+         WHEN s.status = 'trial' THEN 2
+         ELSE 3
+       END,
+       s.updated_at DESC NULLS LAST,
+       s.created_at DESC
        LIMIT 1`,
       [payload.sub]
     );
 
-    const subscriptionPlan = (sub?.plan_name || sub?.plan || 'trial').toLowerCase();
+    const subscriptionPlan = sub ? (sub.plan_name || sub.plan || 'basic').toLowerCase() : null;
     const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
     const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
 
@@ -295,8 +307,8 @@ async function handleProfileRequest(req: express.Request, res: express.Response)
       ? {
           id: sub.id,
           restaurant_id: partner.id,
-          plan: (sub.plan_name || sub.plan || 'trial').toLowerCase(),
-          status: sub.status || 'trial',
+          plan: subscriptionPlan,
+          status: sub.status || 'active',
           start_date: sub.start_date ? new Date(sub.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
           expiry_date: sub.expiry_date ? new Date(sub.expiry_date).toISOString().slice(0, 10) : null,
           billing_cycle: sub.billing_cycle || sub.plan_billing_cycle || 'monthly',
@@ -402,27 +414,35 @@ app.post('/api/auth/my-resto-sso', async (req: AuthenticatedRequest, res) => {
 
 const subscriptionSelect = `
   SELECT s.id, s.partner_id AS user_id, s.start_date, s.expiry_date, s.auto_renew, s.status,
-    p.id AS plan_id, p.name AS plan_name, p.price, p.billing_cycle, p.max_users, p.max_branches, p.features
+    s.plan, s.amount, s.billing_cycle,
+    p.id AS plan_id, p.name AS plan_name, p.price, p.billing_cycle AS plan_billing_cycle, p.max_users, p.max_branches, p.features
   FROM subscriptions s
-  JOIN subscription_plans p ON p.id = s.plan_id
+  LEFT JOIN subscription_plans p ON p.id = s.plan_id
   WHERE s.partner_id = $1
-  ORDER BY s.created_at DESC
+  ORDER BY CASE
+    WHEN s.status = 'active' THEN 1
+    WHEN s.status = 'trial' THEN 2
+    ELSE 3
+  END,
+  s.updated_at DESC NULLS LAST,
+  s.created_at DESC
   LIMIT 1`;
 
 const subscriptionResponse = (subscription: any) => {
   const daysRemaining = subscription.expiry_date
     ? Math.max(0, Math.ceil((new Date(subscription.expiry_date).getTime() - Date.now()) / 86_400_000))
     : 0;
+  const planName = (subscription.plan_name || subscription.plan || 'basic').toLowerCase();
   return {
     id: subscription.id,
-    plan: subscription.plan_name,
-    price: Number(subscription.price),
-    billingCycle: subscription.billing_cycle,
+    plan: planName,
+    price: Number(subscription.price ?? subscription.amount ?? 0),
+    billingCycle: subscription.billing_cycle || subscription.plan_billing_cycle || 'monthly',
     startDate: subscription.start_date,
     expiryDate: subscription.expiry_date,
     daysRemaining,
-    autoRenew: subscription.auto_renew,
-    status: subscription.status,
+    autoRenew: Boolean(subscription.auto_renew),
+    status: subscription.status || 'active',
     maxUsers: subscription.max_users,
     maxBranches: subscription.max_branches,
     features: subscription.features,
@@ -583,9 +603,15 @@ app.get('/api/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     const latestSubscription = await first(
       `SELECT s.*, p.name AS plan_name, p.max_users, p.max_branches, p.features
        FROM subscriptions s
-       JOIN subscription_plans p ON p.id = s.plan_id
+       LEFT JOIN subscription_plans p ON p.id = s.plan_id
        WHERE s.partner_id=$1
-       ORDER BY s.created_at DESC
+       ORDER BY CASE
+         WHEN s.status = 'active' THEN 1
+         WHEN s.status = 'trial' THEN 2
+         ELSE 3
+       END,
+       s.updated_at DESC NULLS LAST,
+       s.created_at DESC
        LIMIT 1`,
       [req.userId]
     );
@@ -1679,14 +1705,20 @@ app.get('/api/dashboard', requireAuth, async (req: AuthenticatedRequest, res) =>
   const id = req.userId;
   if (!id) return res.status(401).json({ error: 'Unauthorized' });
   await expireSubscriptions(id);
-  const [partner, subscription, invoices, tickets, notifications] = await Promise.all([
+    const [partner, subscription, invoices, tickets, notifications] = await Promise.all([
     first('SELECT * FROM partners WHERE id=$1', [id]),
     first(
       `SELECT s.*, p.name AS plan_name, p.price, p.billing_cycle AS plan_billing_cycle, p.max_users, p.max_branches, p.features
        FROM subscriptions s
        LEFT JOIN subscription_plans p ON p.id = s.plan_id
        WHERE s.partner_id = $1
-       ORDER BY s.created_at DESC
+       ORDER BY CASE
+         WHEN s.status = 'active' THEN 1
+         WHEN s.status = 'trial' THEN 2
+         ELSE 3
+       END,
+       s.updated_at DESC NULLS LAST,
+       s.created_at DESC
        LIMIT 1`,
       [id]
     ),
@@ -1711,7 +1743,13 @@ app.get('/api/subscription', requireAuth, async (req: AuthenticatedRequest, res)
      FROM subscriptions s
      LEFT JOIN subscription_plans p ON p.id = s.plan_id
      WHERE s.partner_id = $1
-     ORDER BY s.created_at DESC
+     ORDER BY CASE
+       WHEN s.status = 'active' THEN 1
+       WHEN s.status = 'trial' THEN 2
+       ELSE 3
+     END,
+     s.updated_at DESC NULLS LAST,
+     s.created_at DESC
      LIMIT 1`,
     [req.userId]
   );
@@ -1852,19 +1890,25 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
        FROM subscriptions s
        LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
        WHERE s.partner_id = $1
-       ORDER BY s.created_at DESC
+       ORDER BY CASE
+         WHEN s.status = 'active' THEN 1
+         WHEN s.status = 'trial' THEN 2
+         ELSE 3
+       END,
+       s.updated_at DESC NULLS LAST,
+       s.created_at DESC
        LIMIT 1`,
       [partnerId]
     );
     if (!sub) return res.json({ data: [] });
-    const planName = (sub.plan_name || sub.plan || 'trial').toLowerCase();
+    const planName = (sub.plan_name || sub.plan || 'basic').toLowerCase();
     const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
     const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
     const mappedSub = {
       id: sub.id,
       restaurant_id: partnerId,
       plan: planName,
-      status: sub.status || 'trial',
+      status: sub.status || 'active',
       start_date: sub.start_date ? new Date(sub.start_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
       expiry_date: sub.expiry_date ? new Date(sub.expiry_date).toISOString().slice(0, 10) : null,
       billing_cycle: sub.billing_cycle || sub.plan_billing_cycle || 'monthly',
