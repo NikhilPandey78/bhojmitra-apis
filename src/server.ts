@@ -2014,6 +2014,75 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
   }
 
   const items = Array.isArray(req.body) ? req.body : [req.body];
+
+  if (table === 'branches') {
+    const sub = await first(
+      `SELECT s.*, p.max_branches, p.name AS plan_name
+       FROM subscriptions s
+       LEFT JOIN subscription_plans p ON p.id = s.plan_id
+       WHERE s.partner_id = $1
+       ORDER BY CASE
+         WHEN s.status = 'active' THEN 1
+         WHEN s.status = 'trial' THEN 2
+         ELSE 3
+       END,
+       s.updated_at DESC NULLS LAST,
+       s.created_at DESC
+       LIMIT 1`,
+      [partnerId]
+    );
+    const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
+    const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const maxBranches = Number(sub?.max_branches ?? defaultBranches);
+
+    const countRes = await db.query('SELECT COUNT(*) FROM branches WHERE restaurant_id = $1', [partnerId]);
+    const currentBranches = parseInt(countRes.rows[0]?.count || '0', 10);
+
+    const newBranches = items.filter((i: any) => !i.id);
+    if (maxBranches < 9999 && (currentBranches + newBranches.length) > maxBranches) {
+      return res.status(403).json({
+        error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxBranches} units/branches. You have already created ${currentBranches} units. Please upgrade your plan to add more.`,
+        code: 'MAX_BRANCHES_EXCEEDED',
+        limit: maxBranches,
+        current: currentBranches,
+      });
+    }
+  }
+
+  if (table === 'restaurant_users') {
+    const sub = await first(
+      `SELECT s.*, p.max_users, p.name AS plan_name
+       FROM subscriptions s
+       LEFT JOIN subscription_plans p ON p.id = s.plan_id
+       WHERE s.partner_id = $1
+       ORDER BY CASE
+         WHEN s.status = 'active' THEN 1
+         WHEN s.status = 'trial' THEN 2
+         ELSE 3
+       END,
+       s.updated_at DESC NULLS LAST,
+       s.created_at DESC
+       LIMIT 1`,
+      [partnerId]
+    );
+    const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
+    const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const maxUsers = Number(sub?.max_users ?? defaultUsers);
+
+    const countRes = await db.query('SELECT COUNT(*) FROM restaurant_users WHERE restaurant_id = $1', [partnerId]);
+    const currentUsers = parseInt(countRes.rows[0]?.count || '0', 10);
+
+    const newUsers = items.filter((i: any) => !i.id);
+    if (maxUsers < 9999 && (currentUsers + newUsers.length) > maxUsers) {
+      return res.status(403).json({
+        error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxUsers} users. You currently have ${currentUsers} team members. Please upgrade your plan to add more.`,
+        code: 'MAX_USERS_EXCEEDED',
+        limit: maxUsers,
+        current: currentUsers,
+      });
+    }
+  }
+
   const inserted: any[] = [];
 
   for (const rawItem of items) {
