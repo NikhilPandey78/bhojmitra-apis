@@ -388,8 +388,12 @@ app.post('/api/auth/my-resto-sso', async (req: AuthenticatedRequest, res) => {
     });
   }
 
-  if (!partner.onboarding_completed && partner.restaurant_name) {
-    await db.query("UPDATE partners SET onboarding_completed = TRUE, onboarding_status = 'completed', updated_at = NOW() WHERE id = $1", [req.userId]);
+  const isOnboarded = Boolean(partner.onboarding_completed || partner.onboarding_status === 'completed');
+  if (!isOnboarded) {
+    return res.status(403).json({
+      error: 'Please complete restaurant onboarding before accessing My Restaurant.',
+      code: 'ONBOARDING_REQUIRED',
+    });
   }
 
   const rawCode = randomBytes(32).toString('hex');
