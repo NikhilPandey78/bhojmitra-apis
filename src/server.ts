@@ -2043,7 +2043,7 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
       if (maxBranches < 9999 && (currentBranches + newBranches.length) > maxBranches) {
         return res.status(403).json({
           error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxBranches} units/branches. You have already created ${currentBranches} units. Please upgrade your plan to add more.`,
-          code: 'MAX_BRANCHES_EXCEEDED',
+          code: 'BRANCH_LIMIT_EXCEEDED',
           limit: maxBranches,
           current: currentBranches,
         });
@@ -2076,11 +2076,50 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
       const newUsers = items.filter((i: any) => !i.id);
       if (maxUsers < 9999 && (currentUsers + newUsers.length) > maxUsers) {
         return res.status(403).json({
-          error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxUsers} users. You currently have ${currentUsers} team members. Please upgrade your plan to add more.`,
-          code: 'MAX_USERS_EXCEEDED',
+          error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxUsers} users. You have already used all ${currentUsers} user slots. Please upgrade your plan to add more team members.`,
+          code: 'USER_LIMIT_EXCEEDED',
           limit: maxUsers,
           current: currentUsers,
         });
+      }
+
+      // Validate each user before inserting
+      for (const rawItem of items) {
+        if (!rawItem.full_name || typeof rawItem.full_name !== 'string' || !rawItem.full_name.trim()) {
+          return res.status(400).json({ error: 'Full name is required.', code: 'INVALID_NAME' });
+        }
+        if (!rawItem.email || typeof rawItem.email !== 'string' || !rawItem.email.trim() || !rawItem.email.includes('@')) {
+          return res.status(400).json({ error: 'Valid email address is required.', code: 'INVALID_EMAIL' });
+        }
+        if (!rawItem.role || typeof rawItem.role !== 'string' || !rawItem.role.trim()) {
+          return res.status(400).json({ error: 'Role is required.', code: 'INVALID_ROLE' });
+        }
+
+        const emailLower = rawItem.email.trim().toLowerCase();
+        const existing = await first(
+          'SELECT id FROM restaurant_users WHERE restaurant_id = $1 AND LOWER(email) = $2',
+          [partnerId, emailLower]
+        );
+        if (existing && (!rawItem.id || existing.id !== rawItem.id)) {
+          return res.status(409).json({
+            error: `A team member with email "${emailLower}" already exists in your restaurant.`,
+            code: 'DUPLICATE_EMAIL',
+          });
+        }
+
+        // Validate branch ownership if branch_id provided
+        if (rawItem.branch_id && rawItem.branch_id !== 'all' && String(rawItem.branch_id).trim()) {
+          const branchRow = await first(
+            'SELECT id FROM branches WHERE id = $1 AND restaurant_id = $2',
+            [String(rawItem.branch_id).trim(), partnerId]
+          );
+          if (!branchRow) {
+            return res.status(400).json({
+              error: 'Selected branch does not belong to your restaurant.',
+              code: 'INVALID_BRANCH',
+            });
+          }
+        }
       }
     }
 
@@ -2172,7 +2211,16 @@ app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, re
     // Foreign key & empty string sanitization
     if ('branch_id' in item && (!item.branch_id || item.branch_id === 'all' || !String(item.branch_id).trim())) {
       item.branch_id = null;
+    } else if ('branch_id' in item && item.branch_id) {
+      const branchRow = await first(
+        'SELECT id FROM branches WHERE id = $1 AND restaurant_id = $2',
+        [String(item.branch_id).trim(), partnerId]
+      );
+      if (!branchRow) {
+        return res.status(400).json({ error: 'Selected branch does not belong to your restaurant.' });
+      }
     }
+
     if ('supplier_id' in item && (!item.supplier_id || !String(item.supplier_id).trim())) {
       item.supplier_id = null;
     }
@@ -2229,41 +2277,95 @@ app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, r
   }
 });
 
-// Restaurant Users (Staff) Management
+// Restaurant Users (Staff) Management (Dedicated aliases)
 app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { full_name, email, phone, role, branch_id, status, permissions } = req.body;
   const partnerId = req.userId;
 
   // Validation
   if (!full_name || typeof full_name !== 'string' || !full_name.trim()) {
-    return res.status(400).json({ error: 'Full name is required.' });
+    return res.status(400).json({ error: 'Full name is required.', code: 'INVALID_NAME' });
   }
-  if (!email || typeof email !== 'string' || !email.trim()) {
-    return res.status(400).json({ error: 'Email is required.' });
+  if (!email || typeof email !== 'string' || !email.trim() || !email.includes('@')) {
+    return res.status(400).json({ error: 'Valid email address is required.', code: 'INVALID_EMAIL' });
   }
   if (!role || typeof role !== 'string' || !role.trim()) {
-    return res.status(400).json({ error: 'Role is required.' });
+    return res.status(400).json({ error: 'Role is required.', code: 'INVALID_ROLE' });
   }
 
   try {
+    // Subscription plan check
+    const sub = await first(
+      `SELECT s.*, p.max_users, p.name AS plan_name
+       FROM subscriptions s
+       LEFT JOIN subscription_plans p ON p.id = s.plan_id
+       WHERE s.partner_id = $1
+       ORDER BY CASE
+         WHEN s.status = 'active' THEN 1
+         WHEN s.status = 'trial' THEN 2
+         ELSE 3
+       END,
+       s.updated_at DESC NULLS LAST,
+       s.created_at DESC
+       LIMIT 1`,
+      [partnerId]
+    );
+    const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
+    const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const maxUsers = Number(sub?.max_users ?? defaultUsers);
+
+    const countRes = await db.query('SELECT COUNT(*) FROM restaurant_users WHERE restaurant_id = $1', [partnerId]);
+    const currentUsers = parseInt(countRes.rows[0]?.count || '0', 10);
+
+    if (maxUsers < 9999 && currentUsers >= maxUsers) {
+      return res.status(403).json({
+        error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxUsers} users. You have already used all ${currentUsers} user slots. Please upgrade your plan to add more team members.`,
+        code: 'USER_LIMIT_EXCEEDED',
+        limit: maxUsers,
+        current: currentUsers,
+      });
+    }
+
+    const emailLower = email.trim().toLowerCase();
+    const existing = await first(
+      'SELECT id FROM restaurant_users WHERE restaurant_id = $1 AND LOWER(email) = $2',
+      [partnerId, emailLower]
+    );
+    if (existing) {
+      return res.status(409).json({
+        error: `A team member with email "${emailLower}" already exists in your restaurant.`,
+        code: 'DUPLICATE_EMAIL',
+      });
+    }
+
     const id = randomUUID();
     const userStatus = status || 'active';
-    const userPermissions = permissions || [];
-    const branchIdValue = branch_id && branch_id !== 'all' && branch_id.trim() ? branch_id.trim() : null;
+    const userPermissions = Array.isArray(permissions) ? permissions : [];
+    let branchIdValue: string | null = null;
+    if (branch_id && branch_id !== 'all' && String(branch_id).trim()) {
+      const branchRow = await first(
+        'SELECT id FROM branches WHERE id = $1 AND restaurant_id = $2',
+        [String(branch_id).trim(), partnerId]
+      );
+      if (!branchRow) {
+        return res.status(400).json({
+          error: 'Selected branch does not belong to your restaurant.',
+          code: 'INVALID_BRANCH',
+        });
+      }
+      branchIdValue = branchRow.id;
+    }
 
     const user = await first(
       `INSERT INTO restaurant_users (id, restaurant_id, full_name, email, phone, role, status, permissions, branch_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [id, partnerId, full_name.trim(), email.trim().toLowerCase(), phone || null, role, userStatus, JSON.stringify(userPermissions), branchIdValue]
+      [id, partnerId, full_name.trim(), emailLower, phone?.trim() || null, role, userStatus, JSON.stringify(userPermissions), branchIdValue]
     );
 
-    res.status(201).json({ success: true, user });
+    res.status(201).json({ data: user, success: true, user });
   } catch (err: any) {
     console.error('Error creating restaurant user:', err);
-    if (err.code === '23505') {
-      return res.status(409).json({ error: 'A user with this email already exists.' });
-    }
     return res.status(500).json({ error: err?.message || 'Failed to create user.' });
   }
 });
@@ -2272,7 +2374,7 @@ app.get('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, 
   const partnerId = req.userId;
   try {
     const users = await db.query('SELECT * FROM restaurant_users WHERE restaurant_id = $1 ORDER BY created_at DESC', [partnerId]);
-    res.json({ users: users.rows });
+    res.json({ data: users.rows, users: users.rows });
   } catch (err: any) {
     console.error('Error fetching restaurant users:', err);
     return res.status(500).json({ error: err?.message || 'Failed to fetch users.' });
@@ -2285,12 +2387,13 @@ app.delete('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedRe
 
   try {
     await db.query('DELETE FROM restaurant_users WHERE id = $1 AND restaurant_id = $2', [id, partnerId]);
-    res.status(204).send();
+    res.status(200).json({ success: true });
   } catch (err: any) {
     console.error('Error deleting restaurant user:', err);
     return res.status(500).json({ error: err?.message || 'Failed to delete user.' });
   }
 });
+
 
 initDatabase().then(() => {
 	app.listen(config.port, () => console.log(`BhojMitra backend listening on http://localhost:${config.port}`));
