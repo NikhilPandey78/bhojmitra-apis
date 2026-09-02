@@ -2229,6 +2229,69 @@ app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, r
   }
 });
 
+// Restaurant Users (Staff) Management
+app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const { full_name, email, phone, role, branch_id, status, permissions } = req.body;
+  const partnerId = req.userId;
+
+  // Validation
+  if (!full_name || typeof full_name !== 'string' || !full_name.trim()) {
+    return res.status(400).json({ error: 'Full name is required.' });
+  }
+  if (!email || typeof email !== 'string' || !email.trim()) {
+    return res.status(400).json({ error: 'Email is required.' });
+  }
+  if (!role || typeof role !== 'string' || !role.trim()) {
+    return res.status(400).json({ error: 'Role is required.' });
+  }
+
+  try {
+    const id = randomUUID();
+    const userStatus = status || 'active';
+    const userPermissions = permissions || [];
+    const branchIdValue = branch_id && branch_id !== 'all' && branch_id.trim() ? branch_id.trim() : null;
+
+    const user = await first(
+      `INSERT INTO restaurant_users (id, restaurant_id, full_name, email, phone, role, status, permissions, branch_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [id, partnerId, full_name.trim(), email.trim().toLowerCase(), phone || null, role, userStatus, JSON.stringify(userPermissions), branchIdValue]
+    );
+
+    res.status(201).json({ success: true, user });
+  } catch (err: any) {
+    console.error('Error creating restaurant user:', err);
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'A user with this email already exists.' });
+    }
+    return res.status(500).json({ error: err?.message || 'Failed to create user.' });
+  }
+});
+
+app.get('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  try {
+    const users = await db.query('SELECT * FROM restaurant_users WHERE restaurant_id = $1 ORDER BY created_at DESC', [partnerId]);
+    res.json({ users: users.rows });
+  } catch (err: any) {
+    console.error('Error fetching restaurant users:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to fetch users.' });
+  }
+});
+
+app.delete('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const { id } = req.params;
+  const partnerId = req.userId;
+
+  try {
+    await db.query('DELETE FROM restaurant_users WHERE id = $1 AND restaurant_id = $2', [id, partnerId]);
+    res.status(204).send();
+  } catch (err: any) {
+    console.error('Error deleting restaurant user:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to delete user.' });
+  }
+});
+
 initDatabase().then(() => {
 	app.listen(config.port, () => console.log(`BhojMitra backend listening on http://localhost:${config.port}`));
 }).catch((error) => {
