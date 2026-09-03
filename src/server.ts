@@ -2281,24 +2281,111 @@ app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, r
   }
 });
 
-// Restaurant Users (Staff) Management (Dedicated aliases)
-app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
-  const { full_name, email, phone, role, branch_id, status, permissions } = req.body;
-  const partnerId = req.userId;
+// ============================================================
+// RESTAURANT USERS (STAFF) MANAGEMENT API (100% TENANT ISOLATED)
+// ============================================================
 
-  // Validation
-  if (!full_name || typeof full_name !== 'string' || !full_name.trim()) {
-    return res.status(400).json({ error: 'Full name is required.', code: 'INVALID_NAME' });
-  }
-  if (!email || typeof email !== 'string' || !email.trim() || !email.includes('@')) {
-    return res.status(400).json({ error: 'Valid email address is required.', code: 'INVALID_EMAIL' });
-  }
-  if (!role || typeof role !== 'string' || !role.trim()) {
-    return res.status(400).json({ error: 'Role is required.', code: 'INVALID_ROLE' });
-  }
+// GET /api/restaurant-users
+app.get('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
 
   try {
-    // Subscription plan check
+    const users = await db.query(
+      `SELECT ru.id, ru.restaurant_id, ru.full_name, ru.email, ru.phone, ru.role, ru.status, ru.permissions, ru.branch_id, ru.created_at, ru.updated_at,
+              b.name AS branch_name
+       FROM restaurant_users ru
+       LEFT JOIN branches b ON b.id = ru.branch_id
+       WHERE ru.restaurant_id = $1
+       ORDER BY ru.created_at DESC`,
+      [partnerId]
+    );
+    return res.json({
+      success: true,
+      data: users.rows,
+      users: users.rows,
+      count: users.rows.length,
+    });
+  } catch (err: any) {
+    console.error('Error fetching restaurant users:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
+  }
+});
+
+// GET /api/restaurant-users/:id
+app.get('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
+  const { id } = req.params;
+
+  try {
+    const user = await first(
+      `SELECT ru.id, ru.restaurant_id, ru.full_name, ru.email, ru.phone, ru.role, ru.status, ru.permissions, ru.branch_id, ru.created_at, ru.updated_at,
+              b.name AS branch_name
+       FROM restaurant_users ru
+       LEFT JOIN branches b ON b.id = ru.branch_id
+       WHERE ru.id = $1 AND ru.restaurant_id = $2`,
+      [id, partnerId]
+    );
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.json({ success: true, data: user, user });
+  } catch (err: any) {
+    console.error('Error fetching restaurant user:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
+  }
+});
+
+// POST /api/restaurant-users
+app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
+  const { full_name, email, phone, role, branch_id, status, permissions } = req.body || {};
+
+  // 1. Required string validation
+  if (!full_name || typeof full_name !== 'string' || !full_name.trim()) {
+    return res.status(400).json({ success: false, message: 'Full name is required.', code: 'INVALID_NAME' });
+  }
+  if (!email || typeof email !== 'string' || !email.trim() || !email.includes('@')) {
+    return res.status(400).json({ success: false, message: 'Valid email address is required.', code: 'INVALID_EMAIL' });
+  }
+  if (!role || typeof role !== 'string' || !role.trim()) {
+    return res.status(400).json({ success: false, message: 'Role is required.', code: 'INVALID_ROLE' });
+  }
+
+  const emailLower = email.trim().toLowerCase();
+
+  try {
+    // 2. Branch ownership validation
+    let branchIdValue: string | null = null;
+    if (branch_id && branch_id !== 'all' && String(branch_id).trim()) {
+      const branchRow = await first(
+        'SELECT id FROM branches WHERE id = $1 AND restaurant_id = $2',
+        [String(branch_id).trim(), partnerId]
+      );
+      if (!branchRow) {
+        return res.status(400).json({
+          success: false,
+          message: 'Selected branch does not belong to your restaurant.',
+          code: 'INVALID_BRANCH',
+        });
+      }
+      branchIdValue = branchRow.id;
+    }
+
+    // 3. Duplicate email check within tenant
+    const existing = await first(
+      'SELECT id FROM restaurant_users WHERE restaurant_id = $1 AND LOWER(email) = $2',
+      [partnerId, emailLower]
+    );
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: `A team member with email "${emailLower}" already exists in your restaurant.`,
+        code: 'DUPLICATE_EMAIL',
+      });
+    }
+
+    // 4. Subscription plan capacity check
     const sub = await first(
       `SELECT s.*, p.max_users, p.name AS plan_name
        FROM subscriptions s
@@ -2323,80 +2410,336 @@ app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest,
 
     if (maxUsers < 9999 && currentUsers >= maxUsers) {
       return res.status(403).json({
-        error: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxUsers} users. You have already used all ${currentUsers} user slots. Please upgrade your plan to add more team members.`,
-        code: 'USER_LIMIT_EXCEEDED',
+        success: false,
+        message: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxUsers} users. You have already used all ${currentUsers} user slots. Please upgrade your plan to add more team members.`,
+        code: 'MAX_USERS_EXCEEDED',
         limit: maxUsers,
         current: currentUsers,
-      });
-    }
-
-    const emailLower = email.trim().toLowerCase();
-    const existing = await first(
-      'SELECT id FROM restaurant_users WHERE restaurant_id = $1 AND LOWER(email) = $2',
-      [partnerId, emailLower]
-    );
-    if (existing) {
-      return res.status(409).json({
-        error: `A team member with email "${emailLower}" already exists in your restaurant.`,
-        code: 'DUPLICATE_EMAIL',
       });
     }
 
     const id = randomUUID();
     const userStatus = status || 'active';
     const userPermissions = Array.isArray(permissions) ? permissions : [];
-    let branchIdValue: string | null = null;
-    if (branch_id && branch_id !== 'all' && String(branch_id).trim()) {
-      const branchRow = await first(
-        'SELECT id FROM branches WHERE id = $1 AND restaurant_id = $2',
-        [String(branch_id).trim(), partnerId]
-      );
-      if (!branchRow) {
-        return res.status(400).json({
-          error: 'Selected branch does not belong to your restaurant.',
-          code: 'INVALID_BRANCH',
-        });
-      }
-      branchIdValue = branchRow.id;
-    }
 
     const user = await first(
       `INSERT INTO restaurant_users (id, restaurant_id, full_name, email, phone, role, status, permissions, branch_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [id, partnerId, full_name.trim(), emailLower, phone?.trim() || null, role, userStatus, JSON.stringify(userPermissions), branchIdValue]
+      [id, partnerId, full_name.trim(), emailLower, phone ? String(phone).trim() : null, role.trim(), userStatus, JSON.stringify(userPermissions), branchIdValue]
     );
 
-    res.status(201).json({ data: user, success: true, user });
+    return res.status(201).json({
+      success: true,
+      data: user,
+      user,
+      message: 'User created successfully.',
+    });
   } catch (err: any) {
     console.error('Error creating restaurant user:', err);
-    return res.status(500).json({ error: err?.message || 'Failed to create user.' });
+    return res.status(500).json({ success: false, message: err?.message || 'Failed to create user.' });
   }
 });
 
-app.get('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
+
+// PATCH /api/restaurant-users/:id
+app.patch('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
   const partnerId = req.userId;
-  try {
-    const users = await db.query('SELECT * FROM restaurant_users WHERE restaurant_id = $1 ORDER BY created_at DESC', [partnerId]);
-    res.json({ data: users.rows, users: users.rows });
-  } catch (err: any) {
-    console.error('Error fetching restaurant users:', err);
-    return res.status(500).json({ error: err?.message || 'Failed to fetch users.' });
-  }
-});
-
-app.delete('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
   const { id } = req.params;
-  const partnerId = req.userId;
 
   try {
+    const existing = await first(
+      'SELECT * FROM restaurant_users WHERE id = $1 AND restaurant_id = $2',
+      [id, partnerId]
+    );
+    if (!existing) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const { full_name, email, phone, role, branch_id, status, permissions } = req.body || {};
+
+    let updatedName = existing.full_name;
+    if (full_name !== undefined) {
+      if (typeof full_name !== 'string' || !full_name.trim()) {
+        return res.status(400).json({ success: false, message: 'Full name cannot be empty', code: 'INVALID_NAME' });
+      }
+      updatedName = full_name.trim();
+    }
+
+    let updatedEmail = existing.email;
+    if (email !== undefined) {
+      if (typeof email !== 'string' || !email.trim() || !email.includes('@')) {
+        return res.status(400).json({ success: false, message: 'Valid email address is required', code: 'INVALID_EMAIL' });
+      }
+      const emailLower = email.trim().toLowerCase();
+      if (emailLower !== existing.email.toLowerCase()) {
+        const dup = await first(
+          'SELECT id FROM restaurant_users WHERE restaurant_id = $1 AND LOWER(email) = $2 AND id != $3',
+          [partnerId, emailLower, id]
+        );
+        if (dup) {
+          return res.status(409).json({ success: false, message: `A user with email "${emailLower}" already exists.`, code: 'DUPLICATE_EMAIL' });
+        }
+      }
+      updatedEmail = emailLower;
+    }
+
+    let updatedBranchId = existing.branch_id;
+    if (branch_id !== undefined) {
+      if (!branch_id || branch_id === 'all' || !String(branch_id).trim()) {
+        updatedBranchId = null;
+      } else {
+        const branchRow = await first(
+          'SELECT id FROM branches WHERE id = $1 AND restaurant_id = $2',
+          [String(branch_id).trim(), partnerId]
+        );
+        if (!branchRow) {
+          return res.status(400).json({ success: false, message: 'Selected branch does not belong to your restaurant.', code: 'INVALID_BRANCH' });
+        }
+        updatedBranchId = branchRow.id;
+      }
+    }
+
+    const updatedPhone = phone !== undefined ? (phone ? String(phone).trim() : null) : existing.phone;
+    const updatedRole = role !== undefined ? String(role).trim() : existing.role;
+    const updatedStatus = status !== undefined ? String(status).trim() : existing.status;
+    const updatedPermissions = permissions !== undefined ? (Array.isArray(permissions) ? permissions : existing.permissions) : existing.permissions;
+
+    const updated = await first(
+      `UPDATE restaurant_users
+       SET full_name = $1, email = $2, phone = $3, role = $4, branch_id = $5, status = $6, permissions = $7, updated_at = NOW()
+       WHERE id = $8 AND restaurant_id = $9
+       RETURNING *`,
+      [updatedName, updatedEmail, updatedPhone, updatedRole, updatedBranchId, updatedStatus, JSON.stringify(updatedPermissions), id, partnerId]
+    );
+
+    return res.json({ success: true, data: updated, user: updated, message: 'User updated successfully.' });
+  } catch (err: any) {
+    console.error('Error updating restaurant user:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
+  }
+});
+
+// DELETE /api/restaurant-users/:id
+app.delete('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
+  const { id } = req.params;
+
+  try {
+    const existing = await first('SELECT id FROM restaurant_users WHERE id = $1 AND restaurant_id = $2', [id, partnerId]);
+    if (!existing) return res.status(404).json({ success: false, message: 'User not found' });
     await db.query('DELETE FROM restaurant_users WHERE id = $1 AND restaurant_id = $2', [id, partnerId]);
-    res.status(200).json({ success: true });
+    return res.json({ success: true, message: 'User deleted successfully.', data: { id } });
   } catch (err: any) {
     console.error('Error deleting restaurant user:', err);
-    return res.status(500).json({ error: err?.message || 'Failed to delete user.' });
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
   }
 });
+
+app.patch('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const id = (req.query.id || req.body?.id) as string;
+  if (!id) return res.status(400).json({ success: false, message: 'User ID is required' });
+  req.params = { ...req.params, id };
+  const layer = app._router.stack.find((r: any) => r.route?.path === '/api/restaurant-users/:id' && r.route?.methods?.patch);
+  if (layer?.route) return layer.route.stack[layer.route.stack.length - 1].handle(req, res);
+  return res.status(404).json({ success: false, message: 'User not found' });
+});
+
+app.delete('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const id = (req.query.id || req.body?.id) as string;
+  if (!id) return res.status(400).json({ success: false, message: 'User ID is required' });
+  req.params = { ...req.params, id };
+  const layer = app._router.stack.find((r: any) => r.route?.path === '/api/restaurant-users/:id' && r.route?.methods?.delete);
+  if (layer?.route) return layer.route.stack[layer.route.stack.length - 1].handle(req, res);
+  return res.status(404).json({ success: false, message: 'User not found' });
+});
+
+
+// ============================================================
+// BRANCHES (UNITS) MANAGEMENT API (100% TENANT ISOLATED)
+// ============================================================
+
+// GET /api/branches
+app.get('/api/branches', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
+
+  try {
+    const branches = await db.query(
+      'SELECT * FROM branches WHERE restaurant_id = $1 ORDER BY created_at DESC',
+      [partnerId]
+    );
+    return res.json({
+      success: true,
+      data: branches.rows,
+      branches: branches.rows,
+      count: branches.rows.length,
+    });
+  } catch (err: any) {
+    console.error('Error fetching branches:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
+  }
+});
+
+// GET /api/branches/:id
+app.get('/api/branches/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
+  const { id } = req.params;
+
+  try {
+    const branch = await first('SELECT * FROM branches WHERE id = $1 AND restaurant_id = $2', [id, partnerId]);
+    if (!branch) return res.status(404).json({ success: false, message: 'Branch not found' });
+    return res.json({ success: true, data: branch, branch });
+  } catch (err: any) {
+    console.error('Error fetching branch:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
+  }
+});
+
+// POST /api/branches
+app.post('/api/branches', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
+  const { name, code, address, city, state, postal_code, phone, manager_name, status } = req.body || {};
+
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ success: false, message: 'Branch name is required.', code: 'INVALID_NAME' });
+  }
+
+  try {
+    const sub = await first(
+      `SELECT s.*, p.max_branches, p.name AS plan_name
+       FROM subscriptions s
+       LEFT JOIN subscription_plans p ON p.id = s.plan_id
+       WHERE s.partner_id = $1
+       ORDER BY CASE
+         WHEN s.status = 'active' THEN 1
+         WHEN s.status = 'trial' THEN 2
+         ELSE 3
+       END,
+       s.updated_at DESC NULLS LAST,
+       s.created_at DESC
+       LIMIT 1`,
+      [partnerId]
+    );
+    const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
+    const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const maxBranches = Number(sub?.max_branches ?? defaultBranches);
+
+    const countRes = await db.query('SELECT COUNT(*) FROM branches WHERE restaurant_id = $1', [partnerId]);
+    const currentBranches = parseInt(countRes.rows[0]?.count || '0', 10);
+
+    if (maxBranches < 9999 && currentBranches >= maxBranches) {
+      return res.status(403).json({
+        success: false,
+        message: `Your ${sub?.plan_name || 'current'} subscription plan allows up to ${maxBranches} units/branches. You have already created ${currentBranches} units. Please upgrade your plan to add more.`,
+        code: 'MAX_BRANCHES_EXCEEDED',
+        limit: maxBranches,
+        current: currentBranches,
+      });
+    }
+
+    const id = randomUUID();
+    const branch = await first(
+      `INSERT INTO branches (id, restaurant_id, name, code, address, city, state, postal_code, phone, manager_name, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+       RETURNING *`,
+      [
+        id,
+        partnerId,
+        name.trim(),
+        code ? String(code).trim() : null,
+        address ? String(address).trim() : null,
+        city ? String(city).trim() : null,
+        state ? String(state).trim() : null,
+        postal_code ? String(postal_code).trim() : null,
+        phone ? String(phone).trim() : null,
+        manager_name ? String(manager_name).trim() : null,
+        status || 'active',
+      ]
+    );
+
+    return res.status(201).json({ success: true, data: branch, branch, message: 'Branch created successfully.' });
+  } catch (err: any) {
+    console.error('Error creating branch:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
+  }
+});
+
+// PATCH /api/branches/:id
+app.patch('/api/branches/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
+  const { id } = req.params;
+
+  try {
+    const existing = await first('SELECT * FROM branches WHERE id = $1 AND restaurant_id = $2', [id, partnerId]);
+    if (!existing) return res.status(404).json({ success: false, message: 'Branch not found' });
+
+    const { name, code, address, city, state, postal_code, phone, manager_name, status } = req.body || {};
+
+    const updatedName = name !== undefined ? String(name).trim() : existing.name;
+    const updatedCode = code !== undefined ? (code ? String(code).trim() : null) : existing.code;
+    const updatedAddress = address !== undefined ? (address ? String(address).trim() : null) : existing.address;
+    const updatedCity = city !== undefined ? (city ? String(city).trim() : null) : existing.city;
+    const updatedState = state !== undefined ? (state ? String(state).trim() : null) : existing.state;
+    const updatedPostal = postal_code !== undefined ? (postal_code ? String(postal_code).trim() : null) : existing.postal_code;
+    const updatedPhone = phone !== undefined ? (phone ? String(phone).trim() : null) : existing.phone;
+    const updatedManager = manager_name !== undefined ? (manager_name ? String(manager_name).trim() : null) : existing.manager_name;
+    const updatedStatus = status !== undefined ? String(status).trim() : existing.status;
+
+    const updated = await first(
+      `UPDATE branches
+       SET name = $1, code = $2, address = $3, city = $4, state = $5, postal_code = $6, phone = $7, manager_name = $8, status = $9, updated_at = NOW()
+       WHERE id = $10 AND restaurant_id = $11
+       RETURNING *`,
+      [updatedName, updatedCode, updatedAddress, updatedCity, updatedState, updatedPostal, updatedPhone, updatedManager, updatedStatus, id, partnerId]
+    );
+
+    return res.json({ success: true, data: updated, branch: updated, message: 'Branch updated successfully.' });
+  } catch (err: any) {
+    console.error('Error updating branch:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
+  }
+});
+
+// DELETE /api/branches/:id
+app.delete('/api/branches/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
+  const { id } = req.params;
+
+  try {
+    const existing = await first('SELECT id FROM branches WHERE id = $1 AND restaurant_id = $2', [id, partnerId]);
+    if (!existing) return res.status(404).json({ success: false, message: 'Branch not found' });
+    await db.query('DELETE FROM branches WHERE id = $1 AND restaurant_id = $2', [id, partnerId]);
+    return res.json({ success: true, message: 'Branch deleted successfully.', data: { id } });
+  } catch (err: any) {
+    console.error('Error deleting branch:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process request' });
+  }
+});
+
+app.patch('/api/branches', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const id = (req.query.id || req.body?.id) as string;
+  if (!id) return res.status(400).json({ success: false, message: 'Branch ID is required' });
+  req.params = { ...req.params, id };
+  const layer = app._router.stack.find((r: any) => r.route?.path === '/api/branches/:id' && r.route?.methods?.patch);
+  if (layer?.route) return layer.route.stack[layer.route.stack.length - 1].handle(req, res);
+  return res.status(404).json({ success: false, message: 'Branch not found' });
+});
+
+app.delete('/api/branches', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const id = (req.query.id || req.body?.id) as string;
+  if (!id) return res.status(400).json({ success: false, message: 'Branch ID is required' });
+  req.params = { ...req.params, id };
+  const layer = app._router.stack.find((r: any) => r.route?.path === '/api/branches/:id' && r.route?.methods?.delete);
+  if (layer?.route) return layer.route.stack[layer.route.stack.length - 1].handle(req, res);
+  return res.status(404).json({ success: false, message: 'Branch not found' });
+});
+
+
 
 // ============================================================
 // SUPPLIERS MANAGEMENT API (100% TENANT ISOLATED)
