@@ -480,5 +480,12 @@ export async function initDatabase() {
     UPDATE subscriptions s
     SET plan_id = (SELECT id FROM subscription_plans WHERE name = 'Basic')
     WHERE s.plan_id IS NULL;
+
+    ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS partner_id TEXT REFERENCES partners(id) ON DELETE CASCADE;
+    UPDATE suppliers SET partner_id = restaurant_id WHERE partner_id IS NULL AND restaurant_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_suppliers_partner_id ON suppliers(partner_id);
+    CREATE INDEX IF NOT EXISTS idx_suppliers_restaurant ON suppliers(restaurant_id);
+    CREATE INDEX IF NOT EXISTS idx_suppliers_partner_name ON suppliers(restaurant_id, name);
   `);
 }
+

@@ -2131,7 +2131,11 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
       item.id = id;
       if (table !== 'partners' && table !== 'restaurants') {
         item.restaurant_id = partnerId;
+        if (table === 'suppliers') {
+          item.partner_id = partnerId;
+        }
       }
+
 
       // Foreign key & empty string sanitization
       if ('branch_id' in item && (!item.branch_id || item.branch_id === 'all' || !String(item.branch_id).trim())) {
@@ -2393,6 +2397,476 @@ app.delete('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedRe
     return res.status(500).json({ error: err?.message || 'Failed to delete user.' });
   }
 });
+
+// ============================================================
+// SUPPLIERS MANAGEMENT API (100% TENANT ISOLATED)
+// ============================================================
+
+function isValidGSTIN(gst: string): boolean {
+  if (!gst || typeof gst !== 'string') return false;
+  const trimmed = gst.trim();
+  if (trimmed.length !== 15) return false;
+  const gstRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/i;
+  return gstRegex.test(trimmed);
+}
+
+function isValidEmail(email: string): boolean {
+  if (!email || typeof email !== 'string') return false;
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email.trim());
+}
+
+// GET /api/suppliers
+app.get('/api/suppliers', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+
+  try {
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '50'), 10) || 50));
+    const offset = (page - 1) * limit;
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+
+    let whereClause = '(restaurant_id = $1 OR partner_id = $1)';
+    const queryParams: any[] = [partnerId];
+
+    if (search) {
+      queryParams.push(`%${search}%`);
+      whereClause += ` AND (
+        name ILIKE $${queryParams.length} OR
+        contact_person ILIKE $${queryParams.length} OR
+        phone ILIKE $${queryParams.length} OR
+        email ILIKE $${queryParams.length} OR
+        gst_number ILIKE $${queryParams.length} OR
+        city ILIKE $${queryParams.length} OR
+        state ILIKE $${queryParams.length}
+      )`;
+    }
+
+    const countRes = await db.query(
+      `SELECT COUNT(*) FROM suppliers WHERE ${whereClause}`,
+      queryParams
+    );
+    const totalCount = parseInt(countRes.rows[0]?.count || '0', 10);
+
+    const dataParams = [...queryParams, limit, offset];
+    const dataRes = await db.query(
+      `SELECT * FROM suppliers WHERE ${whereClause} ORDER BY created_at DESC LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
+      dataParams
+    );
+
+    return res.json({
+      success: true,
+      data: dataRes.rows,
+      suppliers: dataRes.rows,
+      count: dataRes.rows.length,
+      total: totalCount,
+      page,
+      limit,
+    });
+  } catch (err: any) {
+    console.error('Error in GET /api/suppliers:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process supplier request' });
+  }
+});
+
+// GET /api/suppliers/:id
+app.get('/api/suppliers/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+
+  const { id } = req.params;
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Supplier ID is required' });
+  }
+
+  try {
+    const supplier = await first(
+      'SELECT * FROM suppliers WHERE id = $1 AND (restaurant_id = $2 OR partner_id = $2)',
+      [id, partnerId]
+    );
+
+    if (!supplier) {
+      return res.status(404).json({ success: false, message: 'Supplier not found' });
+    }
+
+    return res.json({ success: true, data: supplier, supplier });
+  } catch (err: any) {
+    console.error('Error in GET /api/suppliers/:id:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process supplier request' });
+  }
+});
+
+// POST /api/suppliers
+app.post('/api/suppliers', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+
+  const {
+    name,
+    contact_person,
+    phone,
+    email,
+    gst_number,
+    payment_terms,
+    address,
+    city,
+    state,
+    postal_code,
+    status,
+  } = req.body || {};
+
+  // 1. Validate Name
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ success: false, message: 'Supplier name is required' });
+  }
+  const trimmedName = name.trim();
+  if (trimmedName.length > 255) {
+    return res.status(400).json({ success: false, message: 'Supplier name cannot exceed 255 characters' });
+  }
+
+  // 2. Validate Email
+  let normalizedEmail: string | null = null;
+  if (email && typeof email === 'string' && email.trim()) {
+    const trimmedEmail = email.trim();
+    if (!isValidEmail(trimmedEmail) || trimmedEmail.length > 255) {
+      return res.status(400).json({ success: false, message: 'Invalid email address' });
+    }
+    normalizedEmail = trimmedEmail.toLowerCase();
+  }
+
+  // 3. Validate Phone
+  let normalizedPhone: string | null = null;
+  if (phone && typeof phone === 'string' && phone.trim()) {
+    const trimmedPhone = phone.trim();
+    if (trimmedPhone.length > 30) {
+      return res.status(400).json({ success: false, message: 'Phone number cannot exceed 30 characters' });
+    }
+    normalizedPhone = trimmedPhone;
+  }
+
+  // 4. Validate GSTIN (15-character standard format)
+  let normalizedGST: string | null = null;
+  if (gst_number && typeof gst_number === 'string' && gst_number.trim()) {
+    const trimmedGST = gst_number.trim();
+    if (!isValidGSTIN(trimmedGST)) {
+      return res.status(400).json({ success: false, message: 'Invalid GST number' });
+    }
+    normalizedGST = trimmedGST.toUpperCase();
+  }
+
+  // 5. Validate Payment Terms
+  let normalizedPaymentTerms = 'Net 30';
+  if (payment_terms && typeof payment_terms === 'string' && payment_terms.trim()) {
+    const trimmedPT = payment_terms.trim();
+    if (trimmedPT.length > 100) {
+      return res.status(400).json({ success: false, message: 'Payment terms cannot exceed 100 characters' });
+    }
+    normalizedPaymentTerms = trimmedPT;
+  }
+
+  const normalizedContactPerson = contact_person && typeof contact_person === 'string' && contact_person.trim() ? contact_person.trim().slice(0, 255) : null;
+  const normalizedAddress = address && typeof address === 'string' && address.trim() ? address.trim() : null;
+  const normalizedCity = city && typeof city === 'string' && city.trim() ? city.trim().slice(0, 100) : null;
+  const normalizedState = state && typeof state === 'string' && state.trim() ? state.trim().slice(0, 100) : null;
+  const normalizedPostalCode = postal_code && typeof postal_code === 'string' && postal_code.trim() ? postal_code.trim().slice(0, 20) : null;
+  const supplierStatus = status === 'inactive' ? 'inactive' : 'active';
+
+  try {
+    // 6. Check duplicate name within same tenant
+    const existing = await first(
+      'SELECT id FROM suppliers WHERE (restaurant_id = $1 OR partner_id = $1) AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
+      [partnerId, trimmedName]
+    );
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'Supplier already exists' });
+    }
+
+    const id = randomUUID();
+    const supplier = await first(
+      `INSERT INTO suppliers (
+        id, restaurant_id, partner_id, name, contact_person, phone, email,
+        gst_number, payment_terms, address, city, state, postal_code,
+        outstanding_amount, status, created_at, updated_at
+      ) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 0, $13, NOW(), NOW())
+      RETURNING *`,
+      [
+        id,
+        partnerId,
+        trimmedName,
+        normalizedContactPerson,
+        normalizedPhone,
+        normalizedEmail,
+        normalizedGST,
+        normalizedPaymentTerms,
+        normalizedAddress,
+        normalizedCity,
+        normalizedState,
+        normalizedPostalCode,
+        supplierStatus,
+      ]
+    );
+
+    return res.status(201).json({
+      success: true,
+      data: supplier,
+      supplier,
+      message: 'Supplier added successfully.',
+    });
+  } catch (err: any) {
+    console.error('Error in POST /api/suppliers:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process supplier request' });
+  }
+});
+
+// PATCH /api/suppliers/:id
+app.patch('/api/suppliers/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+
+  const { id } = req.params;
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Supplier ID is required' });
+  }
+
+  try {
+    const existing = await first(
+      'SELECT * FROM suppliers WHERE id = $1 AND (restaurant_id = $2 OR partner_id = $2)',
+      [id, partnerId]
+    );
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Supplier not found' });
+    }
+
+    const {
+      name,
+      contact_person,
+      phone,
+      email,
+      gst_number,
+      payment_terms,
+      address,
+      city,
+      state,
+      postal_code,
+      status,
+      outstanding_amount,
+    } = req.body || {};
+
+    let updatedName = existing.name;
+    if (name !== undefined) {
+      if (typeof name !== 'string' || !name.trim()) {
+        return res.status(400).json({ success: false, message: 'Supplier name cannot be empty' });
+      }
+      const trimmed = name.trim();
+      if (trimmed.length > 255) {
+        return res.status(400).json({ success: false, message: 'Supplier name cannot exceed 255 characters' });
+      }
+
+      // Check duplicate name within same tenant if name changed
+      if (trimmed.toLowerCase() !== existing.name.toLowerCase()) {
+        const dup = await first(
+          'SELECT id FROM suppliers WHERE (restaurant_id = $1 OR partner_id = $1) AND LOWER(TRIM(name)) = LOWER($2) AND id != $3 LIMIT 1',
+          [partnerId, trimmed, id]
+        );
+        if (dup) {
+          return res.status(409).json({ success: false, message: 'Supplier already exists' });
+        }
+      }
+      updatedName = trimmed;
+    }
+
+    let updatedEmail = existing.email;
+    if (email !== undefined) {
+      if (email && typeof email === 'string' && email.trim()) {
+        const trimmedEmail = email.trim();
+        if (!isValidEmail(trimmedEmail) || trimmedEmail.length > 255) {
+          return res.status(400).json({ success: false, message: 'Invalid email address' });
+        }
+        updatedEmail = trimmedEmail.toLowerCase();
+      } else {
+        updatedEmail = null;
+      }
+    }
+
+    let updatedPhone = existing.phone;
+    if (phone !== undefined) {
+      if (phone && typeof phone === 'string' && phone.trim()) {
+        const trimmedPhone = phone.trim();
+        if (trimmedPhone.length > 30) {
+          return res.status(400).json({ success: false, message: 'Phone number cannot exceed 30 characters' });
+        }
+        updatedPhone = trimmedPhone;
+      } else {
+        updatedPhone = null;
+      }
+    }
+
+    let updatedGST = existing.gst_number;
+    if (gst_number !== undefined) {
+      if (gst_number && typeof gst_number === 'string' && gst_number.trim()) {
+        const trimmedGST = gst_number.trim();
+        if (!isValidGSTIN(trimmedGST)) {
+          return res.status(400).json({ success: false, message: 'Invalid GST number' });
+        }
+        updatedGST = trimmedGST.toUpperCase();
+      } else {
+        updatedGST = null;
+      }
+    }
+
+    let updatedPT = existing.payment_terms;
+    if (payment_terms !== undefined) {
+      if (payment_terms && typeof payment_terms === 'string' && payment_terms.trim()) {
+        const trimmedPT = payment_terms.trim();
+        if (trimmedPT.length > 100) {
+          return res.status(400).json({ success: false, message: 'Payment terms cannot exceed 100 characters' });
+        }
+        updatedPT = trimmedPT;
+      } else {
+        updatedPT = 'Net 30';
+      }
+    }
+
+    const updatedContactPerson = contact_person !== undefined
+      ? (contact_person && typeof contact_person === 'string' && contact_person.trim() ? contact_person.trim().slice(0, 255) : null)
+      : existing.contact_person;
+
+    const updatedAddress = address !== undefined
+      ? (address && typeof address === 'string' && address.trim() ? address.trim() : null)
+      : existing.address;
+
+    const updatedCity = city !== undefined
+      ? (city && typeof city === 'string' && city.trim() ? city.trim().slice(0, 100) : null)
+      : existing.city;
+
+    const updatedState = state !== undefined
+      ? (state && typeof state === 'string' && state.trim() ? state.trim().slice(0, 100) : null)
+      : existing.state;
+
+    const updatedPostalCode = postal_code !== undefined
+      ? (postal_code && typeof postal_code === 'string' && postal_code.trim() ? postal_code.trim().slice(0, 20) : null)
+      : existing.postal_code;
+
+    const updatedStatus = status !== undefined
+      ? (status === 'inactive' ? 'inactive' : 'active')
+      : existing.status;
+
+    const updatedOutstanding = outstanding_amount !== undefined && !isNaN(Number(outstanding_amount))
+      ? Number(outstanding_amount)
+      : existing.outstanding_amount;
+
+    const updated = await first(
+      `UPDATE suppliers
+       SET name = $1,
+           contact_person = $2,
+           phone = $3,
+           email = $4,
+           gst_number = $5,
+           payment_terms = $6,
+           address = $7,
+           city = $8,
+           state = $9,
+           postal_code = $10,
+           status = $11,
+           outstanding_amount = $12,
+           partner_id = $13,
+           updated_at = NOW()
+       WHERE id = $14 AND (restaurant_id = $13 OR partner_id = $13)
+       RETURNING *`,
+      [
+        updatedName,
+        updatedContactPerson,
+        updatedPhone,
+        updatedEmail,
+        updatedGST,
+        updatedPT,
+        updatedAddress,
+        updatedCity,
+        updatedState,
+        updatedPostalCode,
+        updatedStatus,
+        updatedOutstanding,
+        partnerId,
+        id,
+      ]
+    );
+
+    return res.json({
+      success: true,
+      data: updated,
+      supplier: updated,
+      message: 'Supplier updated successfully.',
+    });
+  } catch (err: any) {
+    console.error('Error in PATCH /api/suppliers/:id:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process supplier request' });
+  }
+});
+
+// DELETE /api/suppliers/:id
+app.delete('/api/suppliers/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+
+  const { id } = req.params;
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Supplier ID is required' });
+  }
+
+  try {
+    const existing = await first(
+      'SELECT id, name FROM suppliers WHERE id = $1 AND (restaurant_id = $2 OR partner_id = $2)',
+      [id, partnerId]
+    );
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Supplier not found' });
+    }
+
+    // Check FK references before deleting
+    const [invCount, poCount, srCount, prCount] = await Promise.all([
+      db.query('SELECT COUNT(*) FROM inventory_items WHERE supplier_id = $1', [id]),
+      db.query('SELECT COUNT(*) FROM purchase_orders WHERE supplier_id = $1', [id]),
+      db.query('SELECT COUNT(*) FROM stock_receipts WHERE supplier_id = $1', [id]),
+      db.query('SELECT COUNT(*) FROM purchase_returns WHERE supplier_id = $1', [id]),
+    ]);
+
+    const totalRefs =
+      parseInt(invCount.rows[0]?.count || '0', 10) +
+      parseInt(poCount.rows[0]?.count || '0', 10) +
+      parseInt(srCount.rows[0]?.count || '0', 10) +
+      parseInt(prCount.rows[0]?.count || '0', 10);
+
+    if (totalRefs > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete supplier because it is referenced in inventory items or purchase records. You can update its status to inactive instead.',
+      });
+    }
+
+    await db.query('DELETE FROM suppliers WHERE id = $1 AND (restaurant_id = $2 OR partner_id = $2)', [id, partnerId]);
+
+    return res.json({
+      success: true,
+      message: 'Supplier deleted successfully.',
+      data: { id },
+    });
+  } catch (err: any) {
+    console.error('Error in DELETE /api/suppliers/:id:', err);
+    return res.status(500).json({ success: false, message: 'Unable to process supplier request' });
+  }
+});
+
 
 
 initDatabase().then(() => {
