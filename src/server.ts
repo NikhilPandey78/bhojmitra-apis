@@ -407,7 +407,12 @@ app.post('/api/auth/my-resto-sso', async (req: AuthenticatedRequest, res) => {
     [id, codeHash, req.userId, req.userId, expiresAt]
   );
 
-  const ssoUrl = `${config.myRestoUrl.replace(/\/$/, '')}/sso/callback?code=${rawCode}`;
+  const baseRestoUrl = (process.env.MY_RESTO_URL || config.myRestoUrl || 'http://localhost:5173/login').replace(/\/$/, '');
+  const targetPath = baseRestoUrl.includes('/login') || baseRestoUrl.includes('/sso/callback')
+    ? baseRestoUrl
+    : `${baseRestoUrl}/sso/callback`;
+  const delimiter = targetPath.includes('?') ? '&' : '?';
+  const ssoUrl = `${targetPath}${delimiter}code=${rawCode}`;
   return res.json({
     success: true,
     sso_url: ssoUrl,
