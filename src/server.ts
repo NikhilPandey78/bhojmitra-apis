@@ -5477,7 +5477,113 @@ app.get('/api/admin/website/visitors', async (_req, res) => {
   }
 });
 
+// GET /api/public/menu/:restaurantId (Customer QR Menu API - No Auth Required)
+app.get('/api/public/menu/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    let partner = await first(
+      `SELECT id, restaurant_name, business_name, owner_name, email, phone, city, business_type, gst_number FROM partners WHERE id = $1`,
+      [restaurantId]
+    );
 
+    if (!partner) {
+      partner = await first(`SELECT id, restaurant_name, business_name, owner_name, email, phone, city, business_type, gst_number FROM partners ORDER BY created_at DESC LIMIT 1`);
+    }
+
+    if (!partner) {
+      return res.status(404).json({ success: false, message: 'Restaurant not found' });
+    }
+
+    const [itemsRes, tablesRes] = await Promise.all([
+      db.query(
+        `SELECT id, name, category, description, selling_price, is_vegetarian, is_available, status, food_cost
+         FROM menu_items
+         WHERE restaurant_id = $1 AND (status = 'active' OR status IS NULL)
+         ORDER BY category ASC, name ASC`,
+        [partner.id]
+      ),
+      db.query(
+        `SELECT id, table_number, name, section, seating_capacity, status
+         FROM dining_tables
+         WHERE restaurant_id = $1
+         ORDER BY table_number ASC`,
+        [partner.id]
+      ),
+    ]);
+
+    const items = itemsRes.rows;
+    const tables = tablesRes.rows;
+    const categories = Array.from(new Set(items.map((i: any) => i.category).filter(Boolean)));
+
+    return res.json({
+      success: true,
+      restaurant: {
+        id: partner.id,
+        name: partner.restaurant_name || partner.business_name || 'BhojMitra Dining',
+        legal_name: partner.business_name || partner.restaurant_name,
+        phone: partner.phone || '6388433679',
+        email: partner.email,
+        city: partner.city || 'Noida',
+        address: partner.city ? `${partner.city}, India` : 'Commercial Hub, India',
+        business_type: partner.business_type || 'restaurant',
+        gst_number: partner.gst_number || '07AAAAA0000A1Z5',
+      },
+      categories,
+      tables,
+      items,
+    });
+  } catch (err: any) {
+    console.error('Error fetching public menu:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to fetch public menu' });
+  }
+});
+
+// POST /api/public/orders/place (Customer QR Table Order - No Auth Required)
+app.post('/api/public/orders/place', async (req, res) => {
+  try {
+    const { restaurant_id, table_number, customer_name, customer_phone, items, notes, order_type } = req.body;
+    if (!restaurant_id || !items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: 'Invalid order payload' });
+    }
+
+    const orderNum = `ORD-${Date.now().toString().slice(-4)}`;
+    const subtotal = items.reduce((sum: number, it: any) => sum + (Number(it.price || it.selling_price || 0) * Number(it.quantity || 1)), 0);
+    const taxAmount = Math.round((subtotal * 0.05) * 100) / 100;
+    const grandTotal = subtotal + taxAmount;
+
+    // Create sales order
+    await db.query(
+      `INSERT INTO sales_orders (
+        id, restaurant_id, order_number, order_type, customer_name, customer_phone,
+        subtotal, tax_amount, tax_percent, total_amount, payment_mode, payment_status, notes, status, created_at, updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, 5, $9, 'pending', 'unpaid', $10, 'pending', NOW(), NOW()
+      )`,
+      [
+        `ord-${Date.now()}`,
+        restaurant_id,
+        orderNum,
+        order_type || 'dine_in',
+        customer_name || 'Table Guest',
+        customer_phone || null,
+        subtotal,
+        taxAmount,
+        grandTotal,
+        `[Customer Table Order ${table_number ? `T-${table_number}` : ''}] ${notes || ''}`
+      ]
+    );
+
+    return res.json({
+      success: true,
+      message: `Order #${orderNum} placed successfully! The kitchen is preparing your dishes.`,
+      order_number: orderNum,
+      grand_total: grandTotal,
+    });
+  } catch (err: any) {
+    console.error('Error placing public table order:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to place table order' });
+  }
+});
 
 initDatabase().then(() => {
 	app.listen(config.port, () => console.log(`BhojMitra backend listening on http://localhost:${config.port}`));
@@ -5485,3 +5591,4 @@ initDatabase().then(() => {
 	console.error('Unable to initialize PostgreSQL:', error);
 	process.exit(1);
 });
+
