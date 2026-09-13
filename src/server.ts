@@ -18,8 +18,12 @@ const allowedOrigins = [
   'https://myresto.bhojmitra.in',
   'http://localhost:3000',
   'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:5175',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+  'http://127.0.0.1:5175',
   config.corsOrigin,
 ].filter(Boolean);
 
@@ -45,6 +49,19 @@ const razorpay = new Razorpay({
 
 const ONBOARDING_STATUSES = ['pending', 'in_progress', 'completed'] as const;
 const ACCESSIBLE_SUBSCRIPTION_STATUSES = new Set(['trial', 'active']);
+
+async function syncPlanLimits() {
+  try {
+    await db.query(`
+      UPDATE subscription_plans
+      SET max_branches = 1, max_users = 2, features = $1
+      WHERE id = 1 OR LOWER(name) LIKE '%trial%'
+    `, [JSON.stringify(['Full feature access', '14-day trial', 'Up to 2 team members', '1 branch'])]);
+  } catch (err) {
+    console.error('syncPlanLimits error:', err);
+  }
+}
+syncPlanLimits();
 
 async function expireSubscriptions(partnerId: string) {
   await db.query(
@@ -89,40 +106,446 @@ function onboardingSummary(partner: any, subscription: any) {
   };
 }
 
+async function logAdminActivity(
+  restaurantId: string | null,
+  userId: string | null,
+  userName: string | null,
+  action: string,
+  entityType: string,
+  entityId: string | null,
+  description: string,
+  ipAddress?: string
+) {
+  try {
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO activity_logs (id, restaurant_id, user_id, user_name, action, entity_type, entity_id, description, ip_address, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+      [id, restaurantId, userId, userName, action, entityType, entityId, description, ipAddress || '127.0.0.1']
+    );
+  } catch (err) {
+    console.error('Error recording activity log:', err);
+  }
+}
+
+const logActivity = logAdminActivity;
+
 app.get('/health', async (_req, res) => { try { await db.query('SELECT 1'); res.json({ status: 'ok', database: 'postgresql' }); } catch { res.status(503).json({ status: 'error' }); } });
 app.post('/api/auth/register', async (req, res) => {
-  const { owner_name, restaurant_name, email, phone, password } = req.body;
-  if (![owner_name, restaurant_name, email, phone, password].every((value) => typeof value === 'string' && value.trim()) || password.length < 6) {
-    return res.status(400).json({ error: 'Valid registration fields are required.' });
+  const owner_name = req.body?.owner_name || req.body?.fullName || req.body?.ownerName;
+  const restaurant_name = req.body?.restaurant_name || req.body?.restaurantName;
+  const email = req.body?.email;
+  const phone = req.body?.phone;
+  const password = req.body?.password;
+
+  if (
+    !owner_name || typeof owner_name !== 'string' || !owner_name.trim() ||
+    !restaurant_name || typeof restaurant_name !== 'string' || !restaurant_name.trim() ||
+    !email || typeof email !== 'string' || !email.trim() || !email.includes('@') ||
+    !password || typeof password !== 'string' || password.length < 6
+  ) {
+    return res.status(400).json({ error: 'Full name, restaurant name, valid email, and password (min 6 characters) are required.' });
   }
   try {
     const id = randomUUID();
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      const startDate = new Date();
-      await client.query('INSERT INTO users (id,email,password_hash) VALUES ($1,$2,$3)', [id, email.trim().toLowerCase(), await bcrypt.hash(password, 12)]);
+      const emailLower = email.trim().toLowerCase();
+      const ownerNameTrimmed = owner_name.trim();
+      const restoNameTrimmed = restaurant_name.trim();
+      const phoneTrimmed = phone ? phone.trim() : null;
+
+      // 1. Create auth user
+      await client.query('INSERT INTO users (id,email,password_hash) VALUES ($1,$2,$3)', [id, emailLower, await bcrypt.hash(password, 12)]);
+      
+      // 2. Create partner (restaurant / business profile)
+      const businessType = String(req.body.business_type || 'restaurant').toLowerCase().trim();
       await client.query(
-  `INSERT INTO partners
-   (id,owner_name,restaurant_name,email,phone,onboarding_status,onboarding_completed)
-   VALUES ($1,$2,$3,$4,$5,$6,FALSE)`,
-  [
-    id,
-    owner_name.trim(),
-    restaurant_name.trim(),
-    email.trim().toLowerCase(),
-    phone.trim(),
-    'pending',
-  ]
-);
+        `INSERT INTO partners
+         (id,owner_name,restaurant_name,email,phone,business_type,onboarding_status,onboarding_completed)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE)`,
+        [id, ownerNameTrimmed, restoNameTrimmed, emailLower, phoneTrimmed, businessType, 'pending']
+      );
+
+      // 3. Create default Main Branch for this restaurant
+      const mainBranchId = randomUUID();
+      await client.query(
+        `INSERT INTO branches (id, restaurant_id, name, code, address, city, status)
+         VALUES ($1, $2, 'Main Branch', 'MAIN', '', '', 'active')`,
+        [mainBranchId, id]
+      );
+
+      // 4. Create Owner entry in restaurant_users with full permissions
+      await client.query(
+        `INSERT INTO restaurant_users (id, restaurant_id, auth_user_id, full_name, email, phone, role, status, permissions, branch_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 'owner', 'active', $7, $8)`,
+        [id, id, id, ownerNameTrimmed, emailLower, phoneTrimmed, JSON.stringify(['*']), mainBranchId]
+      );
+
+      // 5. Seed standard isolated units of measure for this tenant
+      const defaultUnits = [
+        { name: 'Kilogram', symbol: 'kg', factor: 1 },
+        { name: 'Gram', symbol: 'g', factor: 0.001 },
+        { name: 'Liter', symbol: 'L', factor: 1 },
+        { name: 'Milliliter', symbol: 'ml', factor: 0.001 },
+        { name: 'Pieces', symbol: 'pcs', factor: 1 },
+        { name: 'Box', symbol: 'box', factor: 1 },
+        { name: 'Packet', symbol: 'pkt', factor: 1 },
+        { name: 'Dozen', symbol: 'dz', factor: 12 },
+        { name: 'Can', symbol: 'can', factor: 1 },
+        { name: 'Bottle', symbol: 'btl', factor: 1 },
+      ];
+      for (const u of defaultUnits) {
+        await client.query(
+          `INSERT INTO units (id, restaurant_id, name, symbol, conversion_factor)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [randomUUID(), id, u.name, u.symbol, u.factor]
+        );
+      }
+
+      // 6. Seed industry-tailored categories based on selected business_type
+      const verticalCategoriesMap: Record<string, { name: string; color: string; description: string }[]> = {
+        hotel: [
+          { name: 'Housekeeping Supplies', color: '#3b82f6', description: 'Cleaning chemicals, mops, sanitizers, and detergents' },
+          { name: 'Room Amenities', color: '#10b981', description: 'Toiletries, dental kits, slippers, and bottled water' },
+          { name: 'Linen & Laundry', color: '#6366f1', description: 'Bedsheets, pillow covers, bath towels, and bathrobes' },
+          { name: 'Food & Beverage Raw', color: '#f59e0b', description: 'Kitchen supplies, pantry goods, and bar consumables' },
+          { name: 'Banquet & Event Supplies', color: '#ec4899', description: 'Table decorations, cutlery, chafing dishes, and linens' },
+          { name: 'Maintenance & Engineering', color: '#64748b', description: 'Bulbs, plumbing spares, HVAC filters, and hardware' },
+        ],
+        hospital: [
+          { name: 'Pharmacy & Medicines', color: '#ef4444', description: 'Tablets, syrups, antibiotics, and prescription drugs' },
+          { name: 'Surgical Consumables', color: '#06b6d4', description: 'Gloves, syringes, gauze, sutures, and surgical drapes' },
+          { name: 'ICU & OT Supplies', color: '#dc2626', description: 'Critical care consumables, anesthesia agents, and tubes' },
+          { name: 'Diagnostic & Lab Reagents', color: '#8b5cf6', description: 'Blood tubes, testing strips, reagents, and chemicals' },
+          { name: 'Patient Care & Linen', color: '#10b981', description: 'Hospital bedsheets, patient gowns, and pillows' },
+          { name: 'General Medical Store', color: '#64748b', description: 'Sanitizers, masks, aprons, and general hospital supplies' },
+        ],
+        grocery: [
+          { name: 'Packaged Food & Grains', color: '#f59e0b', description: 'Rice, wheat flour, pulses, cooking oils, and noodles' },
+          { name: 'Snacks & Confectionery', color: '#ec4899', description: 'Biscuits, chips, chocolates, and namkeen' },
+          { name: 'Dairy & Beverages', color: '#06b6d4', description: 'Milk, cheese, butter, cold drinks, and juices' },
+          { name: 'Personal Care & Hygiene', color: '#10b981', description: 'Soaps, shampoos, toothpaste, and skin creams' },
+          { name: 'Household & Cleaning', color: '#3b82f6', description: 'Detergents, floor cleaners, dishwashers, and trash bags' },
+        ],
+        sweet_shop: [
+          { name: 'Milk & Mawa Solids', color: '#f59e0b', description: 'Pure milk, khoya, mawa, paneer, and condensed milk' },
+          { name: 'Sugar & Sweeteners', color: '#64748b', description: 'Refined sugar, jaggery, glucose syrup, and honey' },
+          { name: 'Dry Fruits & Nuts', color: '#8b5cf6', description: 'Almonds, cashews, pistachios, saffron, and raisins' },
+          { name: 'Pure Ghee & Edible Oils', color: '#eab308', description: 'Desi cow ghee, vanaspati, and frying oils' },
+          { name: 'Packaging Sweet Boxes', color: '#ec4899', description: 'Designer sweet boxes, gift hampers, and carry bags' },
+        ],
+        bakery: [
+          { name: 'Flours & Grain Mixes', color: '#f59e0b', description: 'Maida, whole wheat, cake pre-mixes, and yeast' },
+          { name: 'Butter, Fats & Chocolates', color: '#8b5cf6', description: 'Unsalted butter, margarine, dark compound, and cocoa' },
+          { name: 'Essences, Colors & Pastes', color: '#ec4899', description: 'Vanilla extract, food dyes, fruit emulsions, and gels' },
+          { name: 'Cake Toppings & Fondants', color: '#06b6d4', description: 'Whipping cream, sprinkles, fondant icing, and glazes' },
+          { name: 'Bakery Packaging', color: '#64748b', description: 'Cake boxes, pastry trays, bread pouches, and ribbons' },
+        ],
+        cafe: [
+          { name: 'Coffee Beans & Roasts', color: '#8b5cf6', description: 'Espresso blends, Arabica beans, and instant coffee' },
+          { name: 'Syrups & Flavors', color: '#f59e0b', description: 'Caramel, vanilla, hazelnut, and fruit puree' },
+          { name: 'Milk & Dairy Alternatives', color: '#06b6d4', description: 'Fresh milk, oat milk, almond milk, and whipped cream' },
+          { name: 'Bakery & Quick Bites', color: '#ec4899', description: 'Croissants, muffins, cookies, and sandwiches' },
+          { name: 'Cups, Straws & Packaging', color: '#64748b', description: 'Paper cups, cup sleeves, bio-straws, and takeaway bags' },
+        ],
+        retail: [
+          { name: 'Apparel & Clothing', color: '#3b82f6', description: 'Shirts, t-shirts, trousers, ethnic wear, and dresses' },
+          { name: 'Footwear & Shoes', color: '#f59e0b', description: 'Casual shoes, formal footwear, sandals, and socks' },
+          { name: 'Accessories & Bags', color: '#ec4899', description: 'Belts, wallets, handbags, watches, and jewelry' },
+          { name: 'Electronics & Gadgets', color: '#06b6d4', description: 'Chargers, cables, headphones, power banks, and cases' },
+          { name: 'Cosmetics & Beauty', color: '#8b5cf6', description: 'Skincare, perfumes, makeup, and grooming products' },
+        ],
+        restaurant: [
+          { name: 'Vegetables & Produce', color: '#10b981', description: 'Fresh vegetables, fruits, and raw produce' },
+          { name: 'Meat & Poultry', color: '#ef4444', description: 'Chicken, mutton, seafood, and meat products' },
+          { name: 'Dairy & Cheese', color: '#f59e0b', description: 'Milk, cheese, butter, cream, and paneer' },
+          { name: 'Dry Goods & Spices', color: '#8b5cf6', description: 'Rice, flour, oils, lentils, and dry spices' },
+          { name: 'Beverages & Syrups', color: '#06b6d4', description: 'Soft drinks, juices, coffee, tea, and bar mixes' },
+          { name: 'Packaging & Disposables', color: '#64748b', description: 'Takeaway containers, cups, cutlery, and bags' },
+          { name: 'Bakery & Pastry', color: '#ec4899', description: 'Breads, buns, desserts, and baking supplies' },
+          { name: 'Sauces & Condiments', color: '#f97316', description: 'Ketchups, dressings, pastes, and condiments' },
+        ],
+      };
+
+      const categoriesToSeed = verticalCategoriesMap[businessType] || verticalCategoriesMap.restaurant;
+
+      for (const c of categoriesToSeed) {
+        await client.query(
+          `INSERT INTO categories (id, restaurant_id, name, color, description)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [randomUUID(), id, c.name, c.color, c.description]
+        );
+      }
+
+      // 7. Seed standard default dining tables / sections for floor management
+      const defaultTables = [
+        { num: 'T1', name: 'Table 1', section: 'Main Hall', cap: 4 },
+        { num: 'T2', name: 'Table 2', section: 'Main Hall', cap: 4 },
+        { num: 'T3', name: 'Table 3', section: 'Main Hall', cap: 2 },
+        { num: 'T4', name: 'Table 4', section: 'Family Section', cap: 6 },
+        { num: 'T5', name: 'Table 5', section: 'Outdoor Garden', cap: 4 },
+        { num: 'VIP1', name: 'VIP Lounge 1', section: 'VIP Section', cap: 8 },
+      ];
+      for (const t of defaultTables) {
+        await client.query(
+          `INSERT INTO dining_tables (id, restaurant_id, branch_id, table_number, name, section, seating_capacity, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'available')`,
+          [randomUUID(), id, mainBranchId, t.num, t.name, t.section, t.cap]
+        );
+      }
+
+      // 7. Welcome notification tailored to vertical
+      const verticalTitles: Record<string, string> = {
+        hotel: 'Welcome to BhojMitra Hotel & Resort Management!',
+        hospital: 'Welcome to BhojMitra Healthcare & Hospital Management!',
+        grocery: 'Welcome to BhojMitra Supermarket & Grocery Store!',
+        sweet_shop: 'Welcome to BhojMitra Sweet Shop & Mithai Production!',
+        bakery: 'Welcome to BhojMitra Bakery Management!',
+        cafe: 'Welcome to BhojMitra Cafe & Beverage Operations!',
+        retail: 'Welcome to BhojMitra Retail Store Management!',
+        restaurant: 'Welcome to BhojMitra Restaurant Operations!',
+      };
+
+      await client.query(
+        `INSERT INTO notifications (id, partner_id, type, title, message)
+         VALUES ($1, $2, 'system', $3, 'Your workspace has been customized with industry-tailored inventory categories and units.')`,
+        [randomUUID(), id, verticalTitles[businessType] || verticalTitles.restaurant]
+      );
+
+      // 8. Auto-provision Free Trial subscription (14 days, max 1 branch, max 2 users)
+      const trialPlan = (await client.query("SELECT id, name FROM subscription_plans WHERE LOWER(name) LIKE '%trial%' ORDER BY id ASC LIMIT 1")).rows[0];
+      const trialPlanId = trialPlan ? trialPlan.id : 1;
+      await client.query(
+        `INSERT INTO subscriptions (id, partner_id, plan_id, plan, billing_cycle, status, start_date, expiry_date, auto_renew, amount)
+         VALUES ($1, $2, $3, 'trial', 'monthly', 'trial', NOW(), NOW() + INTERVAL '14 days', FALSE, 0)`,
+        [randomUUID(), id, trialPlanId]
+      );
+
+      // 9. Activity Log for Super Admin
+      await client.query(
+        `INSERT INTO activity_logs (id, restaurant_id, user_id, user_name, action, entity_type, entity_id, description, ip_address, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+        [
+          randomUUID(),
+          id,
+          id,
+          ownerNameTrimmed,
+          'Restaurant Registered',
+          'partner',
+          id,
+          `New ${businessType} '${restoNameTrimmed}' registered by ${ownerNameTrimmed}`,
+          req.ip || '127.0.0.1',
+        ]
+      );
+
       await client.query('COMMIT');
-      return res.status(201).json({ token: tokenFor(id), user: { id, email: email.trim().toLowerCase() } });
+      return res.status(201).json({ token: tokenFor(id), user: { id, email: emailLower } });
     } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
   } catch { return res.status(409).json({ error: 'An account with this email already exists.' }); }
 });
-app.post('/api/auth/login', async (req, res) => { const user = await first('SELECT id,email,password_hash FROM users WHERE email=$1', [String(req.body.email || '').trim().toLowerCase()]); if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.password_hash))) return res.status(401).json({ error: 'Invalid email or password.' }); return res.json({ token: tokenFor(user.id), user: { id: user.id, email: user.email } }); });
-app.post('/api/demo-requests', async (req, res) => { const parsed = demoRequestSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: 'Invalid demo request.' }); const ref = referenceId('DMO'); const d = parsed.data; const request = await first('INSERT INTO demo_requests (id,name,restaurant_name,email,phone,city,number_of_branches,preferred_date,preferred_time,message,reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [randomUUID(), d.name,d.restaurant_name,d.email,d.phone,d.city,d.number_of_branches,d.preferred_date,d.preferred_time,d.message,ref]); return res.status(201).json({ request, reference_id: ref }); });
-app.post('/api/contact-queries', async (req, res) => { const { name,email,phone,subject,message } = req.body; if (![name,email,phone,subject,message].every((v) => typeof v === 'string' && v.trim())) return res.status(400).json({ error: 'All contact fields are required.' }); const query = await first('INSERT INTO contact_queries (id,name,email,phone,subject,message,reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [randomUUID(),name,email,phone,subject,message,referenceId('QRY')]); return res.status(201).json({ query }); });
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const user = await first('SELECT id,email,password_hash FROM users WHERE email=$1', [email]);
+  if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.password_hash))) {
+    return res.status(401).json({ error: 'Invalid email or password.' });
+  }
+  const partner = await first('SELECT id, restaurant_name, owner_name, status FROM partners WHERE id = $1', [user.id]);
+  const restoUser = await first('SELECT id, status FROM restaurant_users WHERE auth_user_id = $1 OR id = $1', [user.id]);
+  
+  if (partner?.status === 'suspended' || restoUser?.status === 'suspended') {
+    return res.status(403).json({
+      error: 'Your account has been suspended by BhojMitra Admin. Please contact support at support@bhojmitra.in.',
+      code: 'ACCOUNT_SUSPENDED'
+    });
+  }
+
+  logAdminActivity(partner?.id || user.id, user.id, partner?.owner_name || user.email, 'User Login', 'user', user.id, `User logged in: ${user.email}`, req.ip);
+  return res.json({ token: tokenFor(user.id), user: { id: user.id, email: user.email } });
+});
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: 'Email is required.' });
+  const user = await first('SELECT id, email FROM users WHERE email = $1', [email]);
+  return res.json({ success: true, message: 'Password reset link sent to your email.' });
+});
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password || password.length < 6) {
+    return res.status(400).json({ error: 'Valid email and password (min 6 characters) are required.' });
+  }
+  const user = await first('SELECT id FROM users WHERE email = $1', [String(email).trim().toLowerCase()]);
+  if (!user) {
+    return res.status(404).json({ error: 'User not found.' });
+  }
+  const hashed = await bcrypt.hash(password, 12);
+  await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashed, user.id]);
+  return res.json({ success: true, message: 'Password updated successfully.' });
+});
+app.post('/api/auth/update-password', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const userId = req.userId;
+  const { password } = req.body || {};
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+  if (!password || password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  }
+  const hashed = await bcrypt.hash(password, 12);
+  await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashed, userId]);
+  return res.json({ success: true, message: 'Password updated successfully.' });
+});
+app.post('/api/demo-requests', async (req, res) => {
+  try {
+    const parsed = demoRequestSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Invalid demo request.' });
+    const ref = referenceId('DMO');
+    const d = parsed.data;
+    const ip = req.ip || req.headers['x-forwarded-for'] || '127.0.0.1';
+    const request = await first(
+      'INSERT INTO demo_requests (id,name,restaurant_name,email,phone,city,number_of_branches,preferred_date,preferred_time,message,reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      [randomUUID(), d.name, d.restaurant_name, d.email, d.phone, d.city || 'India', d.number_of_branches || 1, d.preferred_date || null, d.preferred_time || null, d.message || null, ref]
+    );
+    await logActivity(null, null, d.name, 'Demo Requested', 'demo_requests', request.id, `New Demo Request from ${d.name} (${d.restaurant_name}, ${d.phone})`, String(ip));
+    return res.status(201).json({ success: true, request, reference_id: ref });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/contact-queries', async (req, res) => {
+  try {
+    const { name, email, phone, subject, message } = req.body;
+    if (![name, email, phone, subject, message].every((v) => typeof v === 'string' && v.trim())) {
+      return res.status(400).json({ error: 'All contact fields are required.' });
+    }
+    const ref = referenceId('QRY');
+    const ip = req.ip || req.headers['x-forwarded-for'] || '127.0.0.1';
+    const query = await first(
+      'INSERT INTO contact_queries (id,name,email,phone,subject,message,reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [randomUUID(), name, email, phone, subject, message, ref]
+    );
+    await logActivity(null, null, name, 'Website Inquiry', 'contact_queries', query.id, `Contact query from ${name}: "${subject}"`, String(ip));
+    return res.status(201).json({ success: true, query, reference_id: ref });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Instant Suspension Appeal Submission
+app.post('/api/support/suspension-appeal', async (req, res) => {
+  try {
+    const { partnerId, userEmail, restaurantName, message, contactPhone } = req.body;
+    if (!message || !userEmail) {
+      return res.status(400).json({ error: 'Email and appeal message are required.' });
+    }
+
+    const ref = referenceId('APP');
+    const ip = req.ip || req.headers['x-forwarded-for'] || '127.0.0.1';
+
+    // Find matching partner if not provided
+    let pId = partnerId;
+    if (!pId) {
+      const p = await first('SELECT id FROM partners WHERE LOWER(email) = $1', [String(userEmail).toLowerCase().trim()]);
+      pId = p?.id;
+    }
+
+    if (pId) {
+      await db.query(
+        `INSERT INTO support_tickets (id, partner_id, ticket_number, subject, category, priority, status, message)
+         VALUES ($1, $2, $3, $4, 'Account Suspension', 'urgent', 'new', $5)`,
+        [
+          randomUUID(),
+          pId,
+          ref,
+          `Urgent Suspension Appeal - ${restaurantName || userEmail}`,
+          `[Phone: ${contactPhone || 'N/A'}] ${message}`,
+        ]
+      );
+    }
+
+    await logAdminActivity(
+      pId || null,
+      null,
+      userEmail,
+      'Suspension Appeal Raised',
+      'support_tickets',
+      ref,
+      `Suspension appeal #${ref} from ${restaurantName || userEmail} (${contactPhone || 'No phone'}): "${message.slice(0, 100)}"`,
+      String(ip)
+    );
+
+    return res.status(201).json({
+      success: true,
+      ticketNumber: ref,
+      message: 'Your suspension appeal has been submitted directly to Super Admin. Our team will review it urgently.',
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// LIVE VISITOR TRACKING & WEB PRESENCE
+// ============================================================
+app.post('/api/tracking/visit', async (req, res) => {
+  try {
+    const { sessionId, pathname, referrer, deviceType, browser, os, city, country } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'Session ID required' });
+    const ip = String(req.ip || req.headers['x-forwarded-for'] || '127.0.0.1');
+
+    const existing = await first('SELECT id, landing_page FROM website_visitors WHERE session_id = $1', [sessionId]);
+    if (existing) {
+      await db.query(`
+        UPDATE website_visitors
+        SET current_page = $1, is_online = TRUE, last_heartbeat = NOW(), updated_at = NOW()
+        WHERE session_id = $2
+      `, [pathname || '/', sessionId]);
+    } else {
+      await db.query(`
+        INSERT INTO website_visitors (id, session_id, ip_address, user_agent, device_type, browser, os, city, country, referrer, landing_page, current_page, time_spent_seconds, is_online, last_heartbeat, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 0, TRUE, NOW(), NOW(), NOW())
+      `, [
+        randomUUID(),
+        sessionId,
+        ip,
+        req.headers['user-agent'] || '',
+        deviceType || 'desktop',
+        browser || 'Chrome',
+        os || 'Windows',
+        city || 'India',
+        country || 'India',
+        referrer || '',
+        pathname || '/',
+        pathname || '/'
+      ]);
+    }
+    return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/tracking/heartbeat', async (req, res) => {
+  try {
+    const { sessionId, incrementSeconds, isUnload } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'Session ID required' });
+    const inc = Number(incrementSeconds) || 15;
+    const isOnline = !isUnload;
+
+    await db.query(`
+      UPDATE website_visitors
+      SET time_spent_seconds = time_spent_seconds + $1,
+          is_online = $2,
+          last_heartbeat = NOW(),
+          updated_at = NOW()
+      WHERE session_id = $3
+    `, [inc, isOnline, sessionId]);
+
+    return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 // ============================================================
 // SINGLE SIGN-ON (SSO) PUBLIC ENDPOINTS
@@ -198,9 +621,10 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    const subscriptionPlan = sub ? (sub.plan_name || sub.plan || 'basic').toLowerCase() : null;
-    const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
-    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
+    const rawSubPlan = sub ? String(sub.plan_name || sub.plan || 'basic').toLowerCase().trim() : null;
+    const subscriptionPlan = (rawSubPlan === 'free trial' || rawSubPlan === 'trial') ? 'trial' : rawSubPlan;
+    const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : subscriptionPlan === 'trial' ? 1 : 1;
+    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : subscriptionPlan === 'trial' ? 2 : 2;
 
     return res.json({
       success: true,
@@ -224,6 +648,7 @@ app.post('/api/auth/sso/exchange', async (req, res) => {
         postal_code: '',
         country: 'India',
         currency: 'INR',
+        business_type: ssoRow.business_type || 'restaurant',
         logo_url: null,
         status: 'active',
         created_at: ssoRow.created_at,
@@ -278,10 +703,122 @@ async function handleProfileRequest(req: express.Request, res: express.Response)
       return res.status(401).json({ error: 'Invalid session token.' });
     }
 
-    await expireSubscriptions(payload.sub);
+    const authUser = await first('SELECT id, email FROM users WHERE id = $1', [payload.sub]);
+    const userEmail = authUser?.email?.toLowerCase() || '';
 
-    const partner = await first('SELECT * FROM partners WHERE id=$1', [payload.sub]);
+    // 1. Find user's active membership in restaurant_users (prioritizing the most recently updated active membership)
+    let userRoleRow = await first(
+      `SELECT ru.*, b.name AS branch_name
+       FROM restaurant_users ru
+       LEFT JOIN branches b ON b.id = ru.branch_id
+       WHERE (ru.auth_user_id = $1 OR ru.id = $1 OR (LOWER(ru.email) = $2 AND $2 != '')) AND ru.status = 'active'
+       ORDER BY ru.updated_at DESC NULLS LAST, ru.created_at DESC
+       LIMIT 1`,
+      [payload.sub, userEmail]
+    );
+
+    let partner: any = null;
+    if (userRoleRow) {
+      partner = await first('SELECT * FROM partners WHERE id = $1', [userRoleRow.restaurant_id]);
+    }
+
+    if (!partner) {
+      partner = await first('SELECT * FROM partners WHERE id = $1 OR (LOWER(email) = $2 AND $2 != \'\')', [payload.sub, userEmail]);
+    }
+
     if (!partner) return res.status(404).json({ error: 'Partner profile not found.' });
+
+    if (partner.status === 'suspended' || userRoleRow?.status === 'suspended') {
+      return res.status(403).json({
+        error: 'Your account has been suspended by BhojMitra Admin. Please contact support at support@bhojmitra.in.',
+        code: 'ACCOUNT_SUSPENDED',
+      });
+    }
+
+    await expireSubscriptions(partner.id);
+
+    const isOwner = (userRoleRow?.role === 'owner' || partner.id === payload.sub || (userEmail && partner.email?.toLowerCase() === userEmail && userRoleRow?.restaurant_id === partner.id));
+
+    if (isOwner) {
+      if (!userRoleRow) {
+        // Auto-heal owner record in restaurant_users
+        const defaultBranch = await first('SELECT id, name FROM branches WHERE restaurant_id = $1 ORDER BY created_at ASC LIMIT 1', [partner.id]);
+        const bId = defaultBranch?.id || null;
+        const bName = defaultBranch?.name || null;
+        try {
+          await db.query(
+            `INSERT INTO restaurant_users (id, restaurant_id, auth_user_id, full_name, email, phone, role, status, permissions, branch_id)
+             VALUES ($1, $1, $1, $2, $3, $4, 'owner', 'active', $5, $6)
+             ON CONFLICT (id) DO UPDATE SET role = 'owner', permissions = $5`,
+            [partner.id, partner.owner_name, partner.email, partner.phone || null, JSON.stringify(['*']), bId]
+          );
+        } catch (healErr) {
+          console.error('Auto-heal owner error:', healErr);
+        }
+        userRoleRow = {
+          id: partner.id,
+          restaurant_id: partner.id,
+          auth_user_id: partner.id,
+          branch_id: bId,
+          branch_name: bName,
+          full_name: partner.owner_name,
+          email: partner.email,
+          phone: partner.phone || null,
+          role: 'owner',
+          status: 'active',
+          permissions: ['*'],
+          created_at: partner.created_at,
+        };
+      } else {
+        userRoleRow.role = 'owner';
+      }
+    }
+
+    let parsedPermissions: string[] = isOwner ? ['*'] : [];
+    if (userRoleRow?.permissions) {
+      if (Array.isArray(userRoleRow.permissions)) {
+        parsedPermissions = userRoleRow.permissions;
+      } else if (typeof userRoleRow.permissions === 'string') {
+        try {
+          parsedPermissions = JSON.parse(userRoleRow.permissions);
+        } catch {
+          parsedPermissions = isOwner ? ['*'] : [];
+        }
+      }
+    }
+    if (isOwner && !parsedPermissions.includes('*')) {
+      parsedPermissions = ['*'];
+    }
+
+    const restaurantUserObj = userRoleRow
+      ? {
+          id: userRoleRow.id,
+          restaurant_id: partner.id,
+          auth_user_id: userRoleRow.auth_user_id || payload.sub,
+          branch_id: userRoleRow.branch_id || null,
+          branch_name: userRoleRow.branch_name || null,
+          full_name: userRoleRow.full_name || partner.owner_name,
+          email: userRoleRow.email || partner.email,
+          phone: userRoleRow.phone || partner.phone || null,
+          role: isOwner ? 'owner' : (userRoleRow.role || 'staff'),
+          status: userRoleRow.status || 'active',
+          permissions: parsedPermissions,
+          created_at: userRoleRow.created_at || partner.created_at,
+        }
+      : {
+          id: partner.id,
+          restaurant_id: partner.id,
+          auth_user_id: partner.id,
+          branch_id: null,
+          branch_name: null,
+          full_name: partner.owner_name,
+          email: partner.email,
+          phone: partner.phone || null,
+          role: 'owner',
+          status: 'active',
+          permissions: ['*'],
+          created_at: partner.created_at,
+        };
 
     const sub = await first(
       `SELECT s.*, sp.name AS plan_name, sp.price, sp.billing_cycle AS plan_billing_cycle, sp.max_users, sp.max_branches
@@ -296,12 +833,13 @@ async function handleProfileRequest(req: express.Request, res: express.Response)
        s.updated_at DESC NULLS LAST,
        s.created_at DESC
        LIMIT 1`,
-      [payload.sub]
+      [partner.id]
     );
 
-    const subscriptionPlan = sub ? (sub.plan_name || sub.plan || 'basic').toLowerCase() : null;
-    const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
-    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : 2;
+    const rawSubPlan = sub ? String(sub.plan_name || sub.plan || 'basic').toLowerCase().trim() : null;
+    const subscriptionPlan = (rawSubPlan === 'free trial' || rawSubPlan === 'trial') ? 'trial' : rawSubPlan;
+    const defaultBranches = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : subscriptionPlan === 'trial' ? 1 : 1;
+    const defaultUsers = subscriptionPlan === 'pro' ? 9999 : subscriptionPlan === 'basic' ? 5 : subscriptionPlan === 'starter' ? 3 : subscriptionPlan === 'trial' ? 2 : 2;
 
     const subscriptionObj = sub
       ? {
@@ -325,10 +863,10 @@ async function handleProfileRequest(req: express.Request, res: express.Response)
     return res.json({
       success: true,
       user: {
-        id: partner.id,
-        email: partner.email,
+        id: payload.sub,
+        email: restaurantUserObj.email,
         app_metadata: { provider: 'sso' },
-        user_metadata: { full_name: partner.owner_name, restaurant_name: partner.restaurant_name },
+        user_metadata: { full_name: restaurantUserObj.full_name, restaurant_name: partner.restaurant_name },
         aud: 'authenticated',
       },
       restaurant: {
@@ -340,17 +878,9 @@ async function handleProfileRequest(req: express.Request, res: express.Response)
         city: partner.city || '',
         currency: 'INR',
         status: 'active',
+        business_type: partner.business_type || 'restaurant',
       },
-      restaurantUser: {
-        id: partner.id,
-        restaurant_id: partner.id,
-        auth_user_id: partner.id,
-        full_name: partner.owner_name,
-        email: partner.email,
-        phone: partner.phone || null,
-        role: 'owner',
-        status: 'active',
-      },
+      restaurantUser: restaurantUserObj,
       subscription: subscriptionObj,
     });
   } catch {
@@ -385,14 +915,6 @@ app.post('/api/auth/my-resto-sso', async (req: AuthenticatedRequest, res) => {
     return res.status(403).json({
       error: 'Your subscription is expired or inactive. Please renew to access your restaurant.',
       code: 'SUBSCRIPTION_INACTIVE',
-    });
-  }
-
-  const isOnboarded = Boolean(partner.onboarding_completed || partner.onboarding_status === 'completed');
-  if (!isOnboarded) {
-    return res.status(403).json({
-      error: 'Please complete restaurant onboarding before accessing My Restaurant.',
-      code: 'ONBOARDING_REQUIRED',
     });
   }
 
@@ -441,7 +963,8 @@ const subscriptionResponse = (subscription: any) => {
   const daysRemaining = subscription.expiry_date
     ? Math.max(0, Math.ceil((new Date(subscription.expiry_date).getTime() - Date.now()) / 86_400_000))
     : 0;
-  const planName = (subscription.plan_name || subscription.plan || 'basic').toLowerCase();
+  const rawPlanName = String(subscription.plan_name || subscription.plan || 'basic').toLowerCase().trim();
+  const planName = (rawPlanName === 'free trial' || rawPlanName === 'trial') ? 'trial' : rawPlanName;
   return {
     id: subscription.id,
     plan: planName,
@@ -540,6 +1063,125 @@ app.post('/api/subscriptions', async (_req: AuthenticatedRequest, res) => {
     message: 'Subscriptions must be created through the payment flow.',
   });
 });
+
+async function handleSelectPlan(req: AuthenticatedRequest, res: express.Response) {
+  try {
+    const partnerId = req.userId;
+    if (!partnerId) return res.status(401).json({ success: false, error: 'Unauthorized' });
+
+    const rawPlan = String(req.body.plan || '').toLowerCase().trim();
+    if (!['trial', 'starter', 'basic', 'pro'].includes(rawPlan)) {
+      return res.status(400).json({ success: false, error: 'Invalid plan selected. Choose trial, starter, basic, or pro.' });
+    }
+
+    const isTrial = (rawPlan === 'trial');
+    const planPrices: Record<string, number> = {
+      trial: 0,
+      starter: 499,
+      basic: 999,
+      pro: 1999,
+    };
+    const maxBranchesMap: Record<string, number> = {
+      trial: 1,
+      starter: 3,
+      basic: 5,
+      pro: 9999,
+    };
+    const maxUsersMap: Record<string, number> = {
+      trial: 2,
+      starter: 3,
+      basic: 5,
+      pro: 9999,
+    };
+
+    const amount = planPrices[rawPlan] ?? 0;
+    const maxBranches = maxBranchesMap[rawPlan] ?? 1;
+    const maxUsers = maxUsersMap[rawPlan] ?? 2;
+    const startDate = new Date();
+    const expiryDate = new Date();
+    if (isTrial) {
+      expiryDate.setDate(expiryDate.getDate() + 14);
+    } else {
+      expiryDate.setDate(expiryDate.getDate() + 30);
+    }
+
+    const subStatus = isTrial ? 'trial' : 'active';
+    const planRow = await first(
+      'SELECT id FROM subscription_plans WHERE (LOWER(name) = $1 OR LOWER(name) = $2) AND is_active = TRUE LIMIT 1',
+      [rawPlan, rawPlan === 'trial' ? 'free trial' : rawPlan]
+    );
+
+    const existingSub = await first(
+      'SELECT id FROM subscriptions WHERE partner_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [partnerId]
+    );
+
+    let subId = existingSub?.id;
+    if (subId) {
+      await db.query(
+        `UPDATE subscriptions
+         SET plan = $1,
+             plan_id = $2,
+             status = $3,
+             amount = $4,
+             billing_cycle = 'monthly',
+             start_date = $5,
+             expiry_date = $6,
+             auto_renew = $7
+         WHERE id = $8`,
+        [rawPlan, planRow?.id || null, subStatus, amount, startDate, expiryDate, !isTrial, subId]
+      );
+    } else {
+      subId = randomUUID();
+      await db.query(
+        `INSERT INTO subscriptions
+         (id, partner_id, plan, plan_id, status, amount, billing_cycle, start_date, expiry_date, auto_renew)
+         VALUES ($1, $2, $3, $4, $5, $6, 'monthly', $7, $8, $9)`,
+        [subId, partnerId, rawPlan, planRow?.id || null, subStatus, amount, startDate, expiryDate, !isTrial]
+      );
+    }
+
+    await db.query(
+      `UPDATE partners
+       SET status = 'active',
+           free_trial_used_at = CASE WHEN $2 = 'trial' THEN COALESCE(free_trial_used_at, NOW()) ELSE free_trial_used_at END,
+           onboarding_completed = TRUE,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [partnerId, rawPlan]
+    );
+
+    const updatedSub = {
+      id: subId,
+      restaurant_id: partnerId,
+      plan: rawPlan,
+      status: subStatus,
+      start_date: startDate.toISOString().slice(0, 10),
+      expiry_date: expiryDate.toISOString().slice(0, 10),
+      billing_cycle: 'monthly',
+      amount,
+      currency: 'INR',
+      auto_renewal: !isTrial,
+      max_branches: maxBranches,
+      max_users: maxUsers,
+      created_at: startDate.toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    return res.json({
+      success: true,
+      message: `${isTrial ? '14-Day Free Trial' : rawPlan.toUpperCase()} plan activated successfully!`,
+      subscription: updatedSub,
+    });
+  } catch (err: any) {
+    console.error('select-plan error:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to activate plan' });
+  }
+}
+
+app.post('/api/resto/select-plan', handleSelectPlan);
+app.post('/api/subscriptions/select-plan', handleSelectPlan);
+app.post('/api/resto/subscriptions/select-plan', handleSelectPlan);
 
 async function changePlan(req: AuthenticatedRequest, res: express.Response, direction: 'upgrade' | 'downgrade') {
   try {
@@ -1798,7 +2440,9 @@ app.post('/api/support/tickets', requireAuth, async (req: AuthenticatedRequest, 
   const parsed = ticketSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid ticket.' });
   const t = parsed.data;
-  const ticket = await first('INSERT INTO support_tickets (id,partner_id,ticket_number,subject,category,priority,message) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [randomUUID(), req.userId, referenceId('TKT'), t.subject, t.category, t.priority, t.message]);
+  const ticketNumber = referenceId('TKT');
+  const ticket = await first('INSERT INTO support_tickets (id,partner_id,ticket_number,subject,category,priority,message) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [randomUUID(), req.userId, ticketNumber, t.subject, t.category, t.priority, t.message]);
+  logAdminActivity(req.userId, req.userId, null, 'Support Ticket Raised', 'support_ticket', ticket.id, `Ticket #${ticketNumber}: ${t.subject}`, req.ip);
   res.status(201).json({ ticket });
 });
 
@@ -1842,6 +2486,7 @@ const ALLOWED_RESTO_TABLES = new Set([
   'purchase_returns',
   'purchase_return_items',
   'stock_issues',
+  'stock_issue_items',
   'stock_transfers',
   'stock_transfer_items',
   'stock_adjustments',
@@ -1858,6 +2503,120 @@ const ALLOWED_RESTO_TABLES = new Set([
   'restaurants',
   'subscriptions',
   'notifications',
+  'dining_tables',
+  'sales_orders',
+  'sales_order_items',
+  'kot_tickets',
+  'kot_items',
+  'customers',
+  'hotel_rooms',
+  'hotel_bookings',
+  'hotel_banquets',
+  'hospital_departments',
+  'hospital_patients',
+  'patient_medicine_issues',
+  'material_requests',
+  'production_batches',
+  'custom_orders',
+  'customer_khata',
+  'pos_held_bills',
+  'day_closings',
+  'purchase_payments',
+]);
+app.get('/api/resto/dashboard/stats', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [
+      itemStats,
+      salesStats,
+      poStats,
+      todayTxns,
+      branchCount,
+      userCount,
+    ] = await Promise.all([
+      db.query(
+        `SELECT 
+           COUNT(*) as total_items,
+           COALESCE(SUM(current_stock * purchase_price), 0) as inventory_value,
+           COUNT(CASE WHEN current_stock > 0 AND current_stock <= minimum_stock THEN 1 END) as low_stock,
+           COUNT(CASE WHEN current_stock <= 0 THEN 1 END) as out_of_stock
+         FROM inventory_items 
+         WHERE restaurant_id = $1`,
+        [partnerId]
+      ),
+      db.query(
+        `SELECT 
+           COUNT(*) as total_orders,
+           COALESCE(SUM(total_amount), 0) as total_sales,
+           COALESCE(SUM(CASE WHEN DATE(created_at) = $2 THEN total_amount ELSE 0 END), 0) as today_sales
+         FROM sales_orders 
+         WHERE restaurant_id = $1`,
+        [partnerId, today]
+      ),
+      db.query(
+        `SELECT 
+           COUNT(CASE WHEN status IN ('pending', 'pending_approval') THEN 1 END) as pending_pos,
+           COUNT(*) as total_pos
+         FROM purchase_orders 
+         WHERE restaurant_id = $1`,
+        [partnerId]
+      ),
+      db.query(
+        `SELECT 
+           COALESCE(SUM(CASE WHEN transaction_type = 'purchase' OR type = 'in' THEN ABS(COALESCE(quantity_change, quantity, 0) * COALESCE(unit_cost, unit_price, 0)) ELSE 0 END), 0) as today_purchases,
+           COALESCE(SUM(CASE WHEN transaction_type = 'consumption' OR type = 'consumption' THEN ABS(COALESCE(quantity_change, quantity, 0) * COALESCE(unit_cost, unit_price, 0)) ELSE 0 END), 0) as today_consumption,
+           COALESCE(SUM(CASE WHEN transaction_type = 'wastage' OR type = 'wastage' THEN ABS(COALESCE(quantity_change, quantity, 0) * COALESCE(unit_cost, unit_price, 0)) ELSE 0 END), 0) as today_wastage
+         FROM stock_transactions 
+         WHERE restaurant_id = $1 AND DATE(created_at) = $2`,
+        [partnerId, today]
+      ),
+      db.query('SELECT COUNT(*) FROM branches WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT COUNT(*) FROM restaurant_users WHERE restaurant_id = $1', [partnerId]),
+    ]);
+
+    const iRow = itemStats.rows[0] || {};
+    const sRow = salesStats.rows[0] || {};
+    const poRow = poStats.rows[0] || {};
+    const txRow = todayTxns.rows[0] || {};
+
+    return res.json({
+      totalItems: parseInt(iRow.total_items || '0', 10),
+      inventoryValue: parseFloat(iRow.inventory_value || '0'),
+      lowStockItems: parseInt(iRow.low_stock || '0', 10),
+      outOfStockItems: parseInt(iRow.out_of_stock || '0', 10),
+      totalSales: parseFloat(sRow.total_sales || '0'),
+      todaySales: parseFloat(sRow.today_sales || '0'),
+      totalOrders: parseInt(sRow.total_orders || '0', 10),
+      pendingPOs: parseInt(poRow.pending_pos || '0', 10),
+      totalPOs: parseInt(poRow.total_pos || '0', 10),
+      todayPurchases: parseFloat(txRow.today_purchases || '0'),
+      todayConsumption: parseFloat(txRow.today_consumption || '0'),
+      todayWastage: parseFloat(txRow.today_wastage || '0'),
+      totalBranches: parseInt(branchCount.rows[0]?.count || '0', 10),
+      totalUsers: parseInt(userCount.rows[0]?.count || '0', 10),
+    });
+  } catch (err: any) {
+    console.error('Error fetching resto dashboard stats:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to fetch dashboard stats' });
+  }
+});
+
+const TABLES_WITHOUT_CREATED_AT = new Set([
+  'stock_transfer_items',
+  'stock_adjustment_items',
+  'stock_count_items',
+  'kitchen_requisition_items',
+  'recipe_ingredients',
+  'purchase_order_items',
+  'stock_receipt_items',
+  'purchase_return_items',
+  'stock_issue_items',
+  'sales_order_items',
+  'kot_items',
 ]);
 
 app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -1868,7 +2627,8 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
     return res.status(400).json({ error: `Unknown resource: ${table}` });
   }
 
-  if (table === 'restaurants') {
+  try {
+    if (table === 'restaurants') {
     const partner = await first('SELECT * FROM partners WHERE id = $1', [partnerId]);
     if (!partner) return res.json({ data: [] });
     const rest = {
@@ -1884,6 +2644,7 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       postal_code: '',
       country: 'India',
       currency: 'INR',
+      business_type: partner.business_type || 'restaurant',
       logo_url: null,
       status: 'active',
       created_at: partner.created_at,
@@ -1910,9 +2671,10 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       [partnerId]
     );
     if (!sub) return res.json({ data: [] });
-    const planName = (sub.plan_name || sub.plan || 'basic').toLowerCase();
-    const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
-    const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const rawPlanName = String(sub.plan_name || sub.plan || 'basic').toLowerCase().trim();
+    const planName = (rawPlanName === 'free trial' || rawPlanName === 'trial') ? 'trial' : rawPlanName;
+    const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : planName === 'trial' ? 1 : 1;
+    const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : planName === 'trial' ? 2 : 2;
     const mappedSub = {
       id: sub.id,
       restaurant_id: partnerId,
@@ -1939,9 +2701,65 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
   for (const [key, val] of Object.entries(req.query)) {
     if (['order', 'limit', 'select', 'offset'].includes(key)) continue;
     if (key === 'restaurant_id') continue;
-    if (validColRegex.test(key) && val !== undefined) {
-      values.push(val);
-      whereClause += ` AND ${key} = $${values.length}`;
+
+    if (key.endsWith('_gte')) {
+      const col = key.replace(/_gte$/, '');
+      if (validColRegex.test(col) && val !== undefined) {
+        values.push(val);
+        whereClause += ` AND "${col}" >= $${values.length}`;
+      }
+    } else if (key.endsWith('_lte')) {
+      const col = key.replace(/_lte$/, '');
+      if (validColRegex.test(col) && val !== undefined) {
+        values.push(val);
+        whereClause += ` AND "${col}" <= $${values.length}`;
+      }
+    } else if (key.endsWith('_gt')) {
+      const col = key.replace(/_gt$/, '');
+      if (validColRegex.test(col) && val !== undefined) {
+        values.push(val);
+        whereClause += ` AND "${col}" > $${values.length}`;
+      }
+    } else if (key.endsWith('_lt')) {
+      const col = key.replace(/_lt$/, '');
+      if (validColRegex.test(col) && val !== undefined) {
+        values.push(val);
+        whereClause += ` AND "${col}" < $${values.length}`;
+      }
+    } else if (key.endsWith('_neq')) {
+      const col = key.replace(/_neq$/, '');
+      if (validColRegex.test(col) && val !== undefined) {
+        values.push(val);
+        whereClause += ` AND "${col}" != $${values.length}`;
+      }
+    } else if (key.endsWith('_not_null') || (key.endsWith('_not') && String(val) === 'null')) {
+      const col = key.replace(/_not_null$/, '').replace(/_not$/, '');
+      if (validColRegex.test(col)) {
+        whereClause += ` AND "${col}" IS NOT NULL`;
+      }
+    } else if (validColRegex.test(key) && val !== undefined) {
+      const strVal = String(val);
+      if (strVal.startsWith('gte.')) {
+        values.push(strVal.slice(4));
+        whereClause += ` AND "${key}" >= $${values.length}`;
+      } else if (strVal.startsWith('lte.')) {
+        values.push(strVal.slice(4));
+        whereClause += ` AND "${key}" <= $${values.length}`;
+      } else if (strVal.startsWith('gt.')) {
+        values.push(strVal.slice(3));
+        whereClause += ` AND "${key}" > $${values.length}`;
+      } else if (strVal.startsWith('lt.')) {
+        values.push(strVal.slice(3));
+        whereClause += ` AND "${key}" < $${values.length}`;
+      } else if (strVal.startsWith('neq.')) {
+        values.push(strVal.slice(4));
+        whereClause += ` AND "${key}" != $${values.length}`;
+      } else if (strVal === 'null' || val === null) {
+        whereClause += ` AND "${key}" IS NULL`;
+      } else {
+        values.push(val);
+        whereClause += ` AND "${key}" = $${values.length}`;
+      }
     }
   }
 
@@ -1953,7 +2771,7 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
     if (validColRegex.test(col)) {
       orderClause = ` ORDER BY ${col} ${dir}`;
     }
-  } else {
+  } else if (!TABLES_WITHOUT_CREATED_AT.has(table)) {
     orderClause = ` ORDER BY created_at DESC`;
   }
 
@@ -1980,23 +2798,140 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.unit = unitMap[row.unit_id] || null;
       row.supplier = suppMap[row.supplier_id] || null;
     }
-  } else if (table === 'stock_transactions' && rows.length > 0) {
-    const items = await db.query('SELECT * FROM inventory_items WHERE restaurant_id = $1', [partnerId]);
-    const itemMap = Object.fromEntries(items.rows.map(i => [i.id, i]));
+  } else if ((table === 'stock_transactions' || table === 'wastage_records') && rows.length > 0) {
+    const [items, units] = await Promise.all([
+      db.query('SELECT * FROM inventory_items WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM units WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const unitMap = Object.fromEntries(units.rows.map(u => [u.id, u]));
+    const itemMap = Object.fromEntries(items.rows.map(i => {
+      i.unit = unitMap[i.unit_id] || null;
+      return [i.id, i];
+    }));
     for (const row of rows) {
       row.item = itemMap[row.item_id] || null;
     }
-  } else if ((table === 'stock_receipts' || table === 'purchase_orders' || table === 'purchase_returns') && rows.length > 0) {
-    const supps = await db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]);
+  } else if (table === 'stock_transfers' && rows.length > 0) {
+    const [branches, items] = await Promise.all([
+      db.query('SELECT * FROM branches WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM stock_transfer_items WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const branchMap = Object.fromEntries(branches.rows.map(b => [b.id, b]));
+    const itemsByTransfer: Record<string, any[]> = {};
+    for (const it of items.rows) {
+      if (!itemsByTransfer[it.stock_transfer_id]) itemsByTransfer[it.stock_transfer_id] = [];
+      itemsByTransfer[it.stock_transfer_id].push(it);
+    }
+    for (const row of rows) {
+      row.from_branch = branchMap[row.from_branch_id] || null;
+      row.to_branch = branchMap[row.to_branch_id] || null;
+      row.items = itemsByTransfer[row.id] || [];
+    }
+  } else if (table === 'purchase_orders' && rows.length > 0) {
+    const [supps, items] = await Promise.all([
+      db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM purchase_order_items WHERE restaurant_id = $1', [partnerId]),
+    ]);
     const suppMap = Object.fromEntries(supps.rows.map(s => [s.id, s]));
+    const itemsByPO: Record<string, any[]> = {};
+    for (const it of items.rows) {
+      if (!itemsByPO[it.purchase_order_id]) itemsByPO[it.purchase_order_id] = [];
+      itemsByPO[it.purchase_order_id].push(it);
+    }
     for (const row of rows) {
       row.supplier = suppMap[row.supplier_id] || null;
+      row.items = itemsByPO[row.id] || [];
     }
-  } else if (table === 'wastage_records' && rows.length > 0) {
-    const items = await db.query('SELECT * FROM inventory_items WHERE restaurant_id = $1', [partnerId]);
-    const itemMap = Object.fromEntries(items.rows.map(i => [i.id, i]));
+  } else if (table === 'stock_receipts' && rows.length > 0) {
+    const [supps, items] = await Promise.all([
+      db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM stock_receipt_items WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const suppMap = Object.fromEntries(supps.rows.map(s => [s.id, s]));
+    const itemsByReceipt: Record<string, any[]> = {};
+    for (const it of items.rows) {
+      if (!itemsByReceipt[it.stock_receipt_id]) itemsByReceipt[it.stock_receipt_id] = [];
+      itemsByReceipt[it.stock_receipt_id].push(it);
+    }
     for (const row of rows) {
-      row.item = itemMap[row.item_id] || null;
+      row.supplier = suppMap[row.supplier_id] || null;
+      row.items = itemsByReceipt[row.id] || [];
+    }
+  } else if (table === 'purchase_returns' && rows.length > 0) {
+    const [supps, items] = await Promise.all([
+      db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM purchase_return_items WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const suppMap = Object.fromEntries(supps.rows.map(s => [s.id, s]));
+    const itemsByReturn: Record<string, any[]> = {};
+    for (const it of items.rows) {
+      if (!itemsByReturn[it.purchase_return_id]) itemsByReturn[it.purchase_return_id] = [];
+      itemsByReturn[it.purchase_return_id].push(it);
+    }
+    for (const row of rows) {
+      row.supplier = suppMap[row.supplier_id] || null;
+      row.items = itemsByReturn[row.id] || [];
+    }
+  } else if (table === 'stock_adjustments' && rows.length > 0) {
+    const items = await db.query('SELECT * FROM stock_adjustment_items WHERE restaurant_id = $1', [partnerId]);
+    const itemsByAdj: Record<string, any[]> = {};
+    for (const it of items.rows) {
+      if (!itemsByAdj[it.stock_adjustment_id]) itemsByAdj[it.stock_adjustment_id] = [];
+      itemsByAdj[it.stock_adjustment_id].push(it);
+    }
+    for (const row of rows) {
+      row.items = itemsByAdj[row.id] || [];
+    }
+  } else if (table === 'stock_counts' && rows.length > 0) {
+    const [branches, items] = await Promise.all([
+      db.query('SELECT * FROM branches WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM stock_count_items WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const branchMap = Object.fromEntries(branches.rows.map(b => [b.id, b]));
+    const itemsByCount: Record<string, any[]> = {};
+    for (const it of items.rows) {
+      if (!itemsByCount[it.stock_count_id]) itemsByCount[it.stock_count_id] = [];
+      itemsByCount[it.stock_count_id].push(it);
+    }
+    for (const row of rows) {
+      row.branch = branchMap[row.branch_id] || null;
+      row.items = itemsByCount[row.id] || [];
+    }
+  } else if (table === 'stock_issues' && rows.length > 0) {
+    const items = await db.query('SELECT * FROM stock_issue_items WHERE restaurant_id = $1', [partnerId]);
+    const itemsByIssue: Record<string, any[]> = {};
+    for (const it of items.rows) {
+      if (!itemsByIssue[it.stock_issue_id]) itemsByIssue[it.stock_issue_id] = [];
+      itemsByIssue[it.stock_issue_id].push(it);
+    }
+    for (const row of rows) {
+      row.items = itemsByIssue[row.id] || [];
+    }
+  } else if (table === 'kitchen_requisitions' && rows.length > 0) {
+    const items = await db.query('SELECT * FROM kitchen_requisition_items WHERE restaurant_id = $1', [partnerId]);
+    const itemsByReq: Record<string, any[]> = {};
+    for (const it of items.rows) {
+      if (!itemsByReq[it.kitchen_requisition_id]) itemsByReq[it.kitchen_requisition_id] = [];
+      itemsByReq[it.kitchen_requisition_id].push(it);
+    }
+    for (const row of rows) {
+      row.items = itemsByReq[row.id] || [];
+    }
+  } else if (table === 'recipes' && rows.length > 0) {
+    const ingredients = await db.query('SELECT * FROM recipe_ingredients WHERE restaurant_id = $1', [partnerId]);
+    const ingByRecipe: Record<string, any[]> = {};
+    for (const ing of ingredients.rows) {
+      if (!ingByRecipe[ing.recipe_id]) ingByRecipe[ing.recipe_id] = [];
+      ingByRecipe[ing.recipe_id].push(ing);
+    }
+    for (const row of rows) {
+      row.ingredients = ingByRecipe[row.id] || [];
+    }
+  } else if (table === 'menu_items' && rows.length > 0) {
+    const recipes = await db.query('SELECT * FROM recipes WHERE restaurant_id = $1', [partnerId]);
+    const recMap = Object.fromEntries(recipes.rows.map(r => [r.id, r]));
+    for (const row of rows) {
+      row.recipe = recMap[row.recipe_id] || null;
     }
   } else if (table === 'unit_conversions' && rows.length > 0) {
     const units = await db.query('SELECT * FROM units WHERE restaurant_id = $1', [partnerId]);
@@ -2007,7 +2942,11 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
     }
   }
 
-  return res.json({ data: rows });
+    return res.json({ data: rows });
+  } catch (err: any) {
+    console.error(`Error in GET /api/resto/${table}:`, err);
+    return res.status(500).json({ error: err?.message || 'Database error occurred while fetching records' });
+  }
 });
 
 app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -2037,8 +2976,9 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
          LIMIT 1`,
         [partnerId]
       );
-      const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
-      const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+      const rawPlanName = String(sub?.plan_name || sub?.plan || 'trial').toLowerCase().trim();
+      const planName = (rawPlanName === 'free trial' || rawPlanName === 'trial') ? 'trial' : rawPlanName;
+      const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : planName === 'trial' ? 1 : 1;
       const maxBranches = Number(sub?.max_branches ?? defaultBranches);
 
       const countRes = await db.query('SELECT COUNT(*) FROM branches WHERE restaurant_id = $1', [partnerId]);
@@ -2071,8 +3011,9 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
          LIMIT 1`,
         [partnerId]
       );
-      const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
-      const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+      const rawPlanName = String(sub?.plan_name || sub?.plan || 'trial').toLowerCase().trim();
+      const planName = (rawPlanName === 'free trial' || rawPlanName === 'trial') ? 'trial' : rawPlanName;
+      const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : planName === 'trial' ? 2 : 2;
       const maxUsers = Number(sub?.max_users ?? defaultUsers);
 
       const countRes = await db.query('SELECT COUNT(*) FROM restaurant_users WHERE restaurant_id = $1', [partnerId]);
@@ -2141,6 +3082,33 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
         }
       }
 
+      // Universal empty string / null sanitization
+      for (const k of Object.keys(item)) {
+        if (item[k] === '' || item[k] === 'null' || item[k] === 'undefined') {
+          item[k] = null;
+        }
+      }
+
+      // Special table auto-mappings
+      if (table === 'dining_tables') {
+        item.name = item.name || item.table_number || item.table_name || 'Table';
+        item.table_number = item.table_number || item.name || 'T-1';
+      }
+      if (table === 'suppliers') {
+        if (item.gstin && !item.gst_number) item.gst_number = item.gstin;
+        if (item.gst_number && !item.gstin) item.gstin = item.gst_number;
+      }
+      if (table === 'stock_transactions') {
+        if (item.type && !item.transaction_type) item.transaction_type = item.type;
+        if (item.transaction_type && !item.type) item.type = item.transaction_type;
+        if (item.quantity !== undefined && item.quantity_change === undefined) {
+          const qtyNum = Number(item.quantity);
+          item.quantity_change = (item.type === 'out' || item.type === 'consumption' || item.type === 'wastage') ? -Math.abs(qtyNum) : Math.abs(qtyNum);
+        }
+        if (item.quantity_change !== undefined && item.quantity === undefined) {
+          item.quantity = Math.abs(Number(item.quantity_change));
+        }
+      }
 
       // Foreign key & empty string sanitization
       if ('branch_id' in item && (!item.branch_id || item.branch_id === 'all' || !String(item.branch_id).trim())) {
@@ -2155,6 +3123,27 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
       if ('unit_id' in item && (!item.unit_id || !String(item.unit_id).trim())) {
         item.unit_id = null;
       }
+      if (table === 'restaurant_users') {
+        const userEmail = item.email ? String(item.email).trim().toLowerCase() : '';
+        const userPass = item.password ? String(item.password) : 'BhojMitra@123';
+        delete item.password;
+
+        if (userEmail) {
+          const passHash = await bcrypt.hash(userPass, 12);
+          const existingAuth = await first('SELECT id FROM users WHERE LOWER(email) = $1', [userEmail]);
+          if (existingAuth) {
+            item.auth_user_id = existingAuth.id;
+            if (rawItem.password) {
+              await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passHash, existingAuth.id]);
+            }
+          } else {
+            const newAuthId = randomUUID();
+            await db.query('INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)', [newAuthId, userEmail, passHash]);
+            item.auth_user_id = newAuthId;
+          }
+        }
+      }
+
       if ('phone' in item && (!item.phone || !String(item.phone).trim())) {
         item.phone = null;
       }
@@ -2162,7 +3151,22 @@ app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res
         item.auth_user_id = null;
       }
 
-      const keys = Object.keys(item).filter(k => k !== 'category' && k !== 'unit' && k !== 'supplier' && k !== 'item' && k !== 'from_unit' && k !== 'to_unit' && k !== 'items');
+      const keys = Object.keys(item).filter(k => {
+        if (table === 'menu_items' && k === 'category' && typeof item[k] === 'string') return true;
+        return (
+          k !== 'category' &&
+          k !== 'unit' &&
+          k !== 'supplier' &&
+          k !== 'item' &&
+          k !== 'from_unit' &&
+          k !== 'to_unit' &&
+          k !== 'items' &&
+          k !== 'ingredients' &&
+          k !== 'branch' &&
+          k !== 'from_branch' &&
+          k !== 'to_branch'
+        );
+      });
       const cols = keys.map(k => `"${k}"`).join(', ');
       const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
       const vals = keys.map(k => {
@@ -2194,14 +3198,13 @@ app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, re
   }
 
   const id = (req.query.id || req.body?.id) as string;
-  if (!id) return res.status(400).json({ error: 'ID is required for update' });
 
   try {
     if (table === 'restaurants') {
-      const { name, legal_name, phone, address, city } = req.body || {};
+      const { name, legal_name, phone, address, city, business_type } = req.body || {};
       const updated = await first(
-        `UPDATE partners SET restaurant_name = COALESCE($1, restaurant_name), business_name = COALESCE($2, business_name), phone = COALESCE($3, phone), city = COALESCE($4, city), updated_at = NOW() WHERE id = $5 RETURNING *`,
-        [name, legal_name, phone, city || address, partnerId]
+        `UPDATE partners SET restaurant_name = COALESCE($1, restaurant_name), business_name = COALESCE($2, business_name), phone = COALESCE($3, phone), city = COALESCE($4, city), business_type = COALESCE($5, business_type), updated_at = NOW() WHERE id = $6 RETURNING *`,
+        [name, legal_name, phone, city || address, business_type, partnerId]
       );
       return res.json({ data: updated });
     }
@@ -2209,13 +3212,44 @@ app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, re
     const item = { ...req.body };
     delete item.id;
     delete item.restaurant_id;
-    delete item.category;
+    if (table !== 'menu_items' || typeof item.category !== 'string') {
+      delete item.category;
+    }
     delete item.unit;
     delete item.supplier;
     delete item.item;
     delete item.from_unit;
     delete item.to_unit;
     delete item.items;
+    delete item.ingredients;
+    delete item.branch;
+    delete item.from_branch;
+    delete item.to_branch;
+
+    // Universal empty string / null sanitization
+    for (const k of Object.keys(item)) {
+      if (item[k] === '' || item[k] === 'null' || item[k] === 'undefined') {
+        item[k] = null;
+      }
+    }
+
+    // Special table auto-mappings
+    if (table === 'dining_tables') {
+      if (item.table_number && !item.name) item.name = item.table_number;
+      if (item.name && !item.table_number) item.table_number = item.name;
+    }
+    if (table === 'suppliers') {
+      if (item.gstin && !item.gst_number) item.gst_number = item.gstin;
+      if (item.gst_number && !item.gstin) item.gstin = item.gst_number;
+    }
+    if (table === 'stock_transactions') {
+      if (item.type && !item.transaction_type) item.transaction_type = item.type;
+      if (item.transaction_type && !item.type) item.type = item.transaction_type;
+      if (item.quantity !== undefined && item.quantity_change === undefined) {
+        const qtyNum = Number(item.quantity);
+        item.quantity_change = (item.type === 'out' || item.type === 'consumption' || item.type === 'wastage') ? -Math.abs(qtyNum) : Math.abs(qtyNum);
+      }
+    }
 
     // Foreign key & empty string sanitization
     if ('branch_id' in item && (!item.branch_id || item.branch_id === 'all' || !String(item.branch_id).trim())) {
@@ -2247,19 +3281,34 @@ app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, re
     if (keys.length === 0) return res.json({ data: null });
 
     const setClauses = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');
-    const vals = keys.map(k => {
+    const vals: any[] = keys.map(k => {
       const v = item[k];
       if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
         return JSON.stringify(v);
       }
       return v;
     });
-    vals.push(id);
-    vals.push(partnerId);
 
-    const sql = `UPDATE ${table} SET ${setClauses} WHERE id = $${vals.length - 1} AND restaurant_id = $${vals.length} RETURNING *`;
-    const updated = await first(sql, vals);
-    return res.json({ data: updated });
+    vals.push(partnerId);
+    let whereClause = `WHERE restaurant_id = $${vals.length}`;
+
+    if (id) {
+      vals.push(id);
+      whereClause += ` AND id = $${vals.length}`;
+    } else {
+      const validColRegex = /^[a-z0-9_]+$/i;
+      for (const [qKey, qVal] of Object.entries(req.query)) {
+        if (['id', 'order', 'limit', 'select', 'offset', 'restaurant_id'].includes(qKey)) continue;
+        if (validColRegex.test(qKey) && qVal !== undefined) {
+          vals.push(qVal === 'false' ? false : qVal === 'true' ? true : qVal);
+          whereClause += ` AND "${qKey}" = $${vals.length}`;
+        }
+      }
+    }
+
+    const sql = `UPDATE ${table} SET ${setClauses} ${whereClause} RETURNING *`;
+    const result = await db.query(sql, vals);
+    return res.json({ data: id ? result.rows[0] || null : result.rows });
   } catch (err: any) {
     console.error(`Error in PATCH /api/resto/${table}:`, err);
     return res.status(500).json({ error: err?.message || 'Database error occurred while updating record' });
@@ -2275,14 +3324,419 @@ app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, r
   }
 
   const id = (req.query.id || req.body?.id) as string;
-  if (!id) return res.status(400).json({ error: 'ID is required for delete' });
+  const vals: any[] = [partnerId];
+  let whereClause = `WHERE restaurant_id = $1`;
+
+  if (id) {
+    vals.push(id);
+    whereClause += ` AND id = $2`;
+  } else {
+    const validColRegex = /^[a-z0-9_]+$/i;
+    for (const [qKey, qVal] of Object.entries(req.query)) {
+      if (['id', 'order', 'limit', 'select', 'offset', 'restaurant_id'].includes(qKey)) continue;
+      if (validColRegex.test(qKey) && qVal !== undefined) {
+        vals.push(qVal === 'false' ? false : qVal === 'true' ? true : qVal);
+        whereClause += ` AND "${qKey}" = $${vals.length}`;
+      }
+    }
+  }
 
   try {
-    await db.query(`DELETE FROM ${table} WHERE id = $1 AND restaurant_id = $2`, [id, partnerId]);
+    await db.query(`DELETE FROM ${table} ${whereClause}`, vals);
     return res.status(200).json({ success: true });
   } catch (err: any) {
     console.error(`Error in DELETE /api/resto/${table}:`, err);
     return res.status(500).json({ error: err?.message || 'Database error occurred while deleting record' });
+  }
+});
+
+// ============================================================
+// POS CHECKOUT & ORDER DISPATCH API
+// ============================================================
+app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const {
+    order_type = 'dine_in',
+    table_id = null,
+    customer_name,
+    customer_phone,
+    items = [],
+    subtotal = 0,
+    discount_amount = 0,
+    discount_percent = 0,
+    tax_amount = 0,
+    tax_percent = 5,
+    total_amount = 0,
+    payment_mode = 'cash',
+    payment_status = 'paid',
+    notes = '',
+    branch_id = null,
+  } = req.body || {};
+
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'At least one order item is required.' });
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Generate Order & KOT Numbers
+    const countRes = await client.query('SELECT COUNT(*) FROM sales_orders WHERE restaurant_id = $1', [partnerId]);
+    const orderCount = parseInt(countRes.rows[0].count, 10) + 1;
+    const orderNumber = `ORD-${String(orderCount).padStart(4, '0')}`;
+    const kotNumber = `KOT-${String(orderCount).padStart(4, '0')}`;
+    const orderId = randomUUID();
+    const kotId = randomUUID();
+
+    // 2. Fetch table details if table_id is provided
+    let tableNumber = null;
+    if (table_id) {
+      const tableRow = (await client.query('SELECT * FROM dining_tables WHERE id = $1 AND restaurant_id = $2', [table_id, partnerId])).rows[0];
+      if (tableRow) {
+        tableNumber = tableRow.table_number || tableRow.name;
+        await client.query(
+          `UPDATE dining_tables SET status = $1, current_order_id = $2, updated_at = NOW() WHERE id = $3`,
+          [payment_status === 'paid' ? 'available' : 'occupied', payment_status === 'paid' ? null : orderId, table_id]
+        );
+      }
+    }
+
+    // 3. Insert sales_orders
+    const orderRow = (
+      await client.query(
+        `INSERT INTO sales_orders
+         (id, restaurant_id, branch_id, table_id, order_number, order_type, customer_name, customer_phone, subtotal, discount_amount, discount_percent, tax_amount, tax_percent, total_amount, payment_status, payment_mode, status, notes, created_by, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'completed', $17, $18, NOW(), NOW())
+         RETURNING *`,
+        [
+          orderId,
+          partnerId,
+          branch_id,
+          table_id,
+          orderNumber,
+          order_type,
+          customer_name || 'Walk-in Guest',
+          customer_phone || null,
+          Number(subtotal),
+          Number(discount_amount),
+          Number(discount_percent),
+          Number(tax_amount),
+          Number(tax_percent),
+          Number(total_amount),
+          payment_status,
+          payment_mode,
+          notes,
+          partnerId,
+        ]
+      )
+    ).rows[0];
+
+    // 4. Insert sales_order_items & deduction from inventory if linked
+    for (const itm of items) {
+      const itmId = randomUUID();
+      const qty = Number(itm.quantity || 1);
+      const rate = Number(itm.unit_price || itm.rate || 0);
+      const lineTotal = Number(itm.total_price || itm.total || qty * rate);
+
+      await client.query(
+        `INSERT INTO sales_order_items
+         (id, sales_order_id, restaurant_id, item_id, menu_item_id, item_name, quantity, unit_price, tax_percent, total_price, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          itmId,
+          orderId,
+          partnerId,
+          itm.item_id || null,
+          itm.menu_item_id || null,
+          itm.item_name || itm.name || 'Item',
+          qty,
+          rate,
+          Number(itm.tax_percent || 0),
+          lineTotal,
+          itm.notes || null,
+        ]
+      );
+
+      // If direct inventory item is linked, deduct stock and record stock_transaction
+      if (itm.item_id) {
+        const invRow = (await client.query('SELECT current_stock FROM inventory_items WHERE id = $1 AND restaurant_id = $2', [itm.item_id, partnerId])).rows[0];
+        if (invRow) {
+          const current = Number(invRow.current_stock || 0);
+          const newQty = Math.max(0, current - qty);
+          await client.query('UPDATE inventory_items SET current_stock = $1, updated_at = NOW() WHERE id = $2', [newQty, itm.item_id]);
+          await client.query(
+            `INSERT INTO stock_transactions
+             (id, restaurant_id, branch_id, item_id, transaction_type, quantity_change, quantity_after, reference_type, reference_id, unit_cost, notes)
+             VALUES ($1, $2, $3, $4, 'sales', $5, $6, 'sales_order', $7, $8, $9)`,
+            [randomUUID(), partnerId, branch_id, itm.item_id, -qty, newQty, orderId, rate, `POS Sale ${orderNumber}`]
+          );
+        }
+      }
+    }
+
+    // 5. Create KOT Ticket for kitchen display
+    const kotTicket = (
+      await client.query(
+        `INSERT INTO kot_tickets
+         (id, restaurant_id, branch_id, table_id, table_number, sales_order_id, kot_number, order_type, server_name, status, notes, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, NOW(), NOW())
+         RETURNING *`,
+        [
+          kotId,
+          partnerId,
+          branch_id,
+          table_id,
+          tableNumber,
+          orderId,
+          kotNumber,
+          order_type,
+          'POS Counter',
+          notes,
+        ]
+      )
+    ).rows[0];
+
+    // Insert KOT Items
+    for (const itm of items) {
+      await client.query(
+        `INSERT INTO kot_items (id, kot_id, restaurant_id, item_name, quantity, unit, notes, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
+        [
+          randomUUID(),
+          kotId,
+          partnerId,
+          itm.item_name || itm.name || 'Item',
+          Number(itm.quantity || 1),
+          itm.unit || 'portion',
+          itm.notes || null,
+        ]
+      );
+    }
+
+    // 6. Update Customer Spend if customer_name or phone is provided
+    if (customer_phone || customer_name) {
+      const existingCust = (
+        await client.query(
+          `SELECT * FROM customers WHERE restaurant_id = $1 AND (phone = $2 OR name = $3) LIMIT 1`,
+          [partnerId, customer_phone || '', customer_name || '']
+        )
+      ).rows[0];
+      if (existingCust) {
+        await client.query(
+          `UPDATE customers SET total_orders = total_orders + 1, total_spend = total_spend + $1, updated_at = NOW() WHERE id = $2`,
+          [Number(total_amount), existingCust.id]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO customers (id, restaurant_id, name, phone, total_orders, total_spend)
+           VALUES ($1, $2, $3, $4, 1, $5)`,
+          [randomUUID(), partnerId, customer_name || 'Guest', customer_phone || null, Number(total_amount)]
+        );
+      }
+    }
+
+    // 7. If payment_mode is 'khata', record transaction in customer_khata ledger
+    if (payment_mode === 'khata' && (customer_name || customer_phone)) {
+      const khataRow = (
+        await client.query(
+          `SELECT * FROM customer_khata WHERE restaurant_id = $1 AND (phone = $2 OR customer_name = $3) LIMIT 1`,
+          [partnerId, customer_phone || '', customer_name || '']
+        )
+      ).rows[0];
+
+      const khataTx = {
+        id: `TX-${Date.now()}`,
+        date: new Date().toISOString().split('T')[0],
+        type: 'credit_sale',
+        amount: Number(total_amount),
+        reference: `POS Sale ${orderNumber}`,
+        notes: notes || 'POS Credit Sale',
+      };
+
+      if (khataRow) {
+        const txList = Array.isArray(khataRow.transactions) ? khataRow.transactions : [];
+        txList.push(khataTx);
+        const newTotalCredit = Number(khataRow.total_credit || 0) + Number(total_amount);
+        const newBalance = Number(khataRow.balance_due || 0) + Number(total_amount);
+        await client.query(
+          `UPDATE customer_khata SET total_credit = $1, balance_due = $2, transactions = $3, updated_at = NOW() WHERE id = $4`,
+          [newTotalCredit, newBalance, JSON.stringify(txList), khataRow.id]
+        );
+      } else {
+        const khataId = randomUUID();
+        await client.query(
+          `INSERT INTO customer_khata (id, restaurant_id, customer_name, phone, credit_limit, total_credit, total_paid, balance_due, status, transactions, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 15000, $5, 0, $5, 'active', $6, NOW(), NOW())`,
+          [khataId, partnerId, customer_name || 'Guest Customer', customer_phone || null, Number(total_amount), JSON.stringify([khataTx])]
+        );
+      }
+    }
+
+    // 8. Activity log for Super Admin
+    await client.query(
+      `INSERT INTO activity_logs (id, restaurant_id, user_id, user_name, action, entity_type, entity_id, description, ip_address, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+      [
+        randomUUID(),
+        partnerId,
+        partnerId,
+        customer_name || 'POS Staff',
+        'Order Placed',
+        'sales_order',
+        orderId,
+        `POS Order #${orderNumber} placed for ₹${Number(total_amount).toLocaleString('en-IN')} (${payment_mode})`,
+        req.ip || '127.0.0.1',
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      data: {
+        order: orderRow,
+        kot: kotTicket,
+        order_number: orderNumber,
+        kot_number: kotNumber,
+      },
+    });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('POS Checkout error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to process POS checkout' });
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /api/resto/kot/:id/status
+app.patch('/api/resto/kot/:id/status', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+  const { id } = req.params;
+  const { status } = req.body || {};
+
+  const validStatuses = ['pending', 'preparing', 'ready', 'served', 'cancelled'];
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  try {
+    const updated = await first(
+      `UPDATE kot_tickets SET status = $1, updated_at = NOW() WHERE id = $2 AND restaurant_id = $3 RETURNING *`,
+      [status, id, partnerId]
+    );
+    if (!updated) return res.status(404).json({ error: 'KOT Ticket not found' });
+
+    await db.query(
+      `UPDATE kot_items SET status = $1 WHERE kot_id = $2 AND restaurant_id = $3`,
+      [status === 'served' ? 'ready' : status, id, partnerId]
+    );
+
+    return res.json({ success: true, data: updated });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to update KOT status' });
+  }
+});
+
+// GET /api/resto/ai-insights/summary
+app.get('/api/resto/ai-insights/summary', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const [itemsRes, txnsRes, recipesRes, wastageRes, salesRes] = await Promise.all([
+      db.query(`SELECT i.*, c.name as category_name, u.symbol as unit_symbol FROM inventory_items i LEFT JOIN categories c ON c.id = i.category_id LEFT JOIN units u ON u.id = i.unit_id WHERE i.restaurant_id = $1`, [partnerId]),
+      db.query(`SELECT * FROM stock_transactions WHERE restaurant_id = $1 AND created_at >= NOW() - INTERVAL '30 days'`, [partnerId]),
+      db.query(`SELECT * FROM recipes WHERE restaurant_id = $1`, [partnerId]),
+      db.query(`SELECT * FROM wastage_records WHERE restaurant_id = $1 AND created_at >= NOW() - INTERVAL '30 days'`, [partnerId]),
+      db.query(`SELECT * FROM sales_orders WHERE restaurant_id = $1 AND created_at >= NOW() - INTERVAL '30 days'`, [partnerId]),
+    ]);
+
+    const items = itemsRes.rows;
+    const txns = txnsRes.rows;
+    const recipes = recipesRes.rows;
+    const wastage = wastageRes.rows;
+    const sales = salesRes.rows;
+
+    // 1. Stock Runout & Reorder Predictions
+    const runoutAlerts = items
+      .map((item) => {
+        const itemTxns = txns.filter((t) => t.item_id === item.id && (t.transaction_type === 'consumption' || t.transaction_type === 'sales'));
+        const totalUsed = itemTxns.reduce((sum, t) => sum + Math.abs(Number(t.quantity_change || 0)), 0);
+        const dailyBurnRate = totalUsed > 0 ? totalUsed / 30 : 0.5;
+        const currentStock = Number(item.current_stock || 0);
+        const daysRemaining = dailyBurnRate > 0 ? Math.round(currentStock / dailyBurnRate) : 999;
+        const minStock = Number(item.minimum_stock || 0);
+        const isUrgent = currentStock <= minStock || daysRemaining <= 3;
+
+        return {
+          id: item.id,
+          name: item.name,
+          category: item.category_name || 'General',
+          unit: item.unit_symbol || 'units',
+          current_stock: currentStock,
+          daily_burn_rate: parseFloat(dailyBurnRate.toFixed(2)),
+          days_remaining: daysRemaining,
+          minimum_stock: minStock,
+          is_urgent: isUrgent,
+          recommendation: isUrgent ? `Order ${(minStock * 2) || 20} ${item.unit_symbol || 'units'} immediately to prevent stockout.` : 'Stock is within safe operational levels.',
+        };
+      })
+      .filter((a) => a.is_urgent)
+      .slice(0, 6);
+
+    // 2. High Wastage Impact Analysis
+    const wastageByItem: Record<string, { name: string; total_loss: number; count: number }> = {};
+    for (const w of wastage) {
+      const key = w.item_name || w.item_id || 'Other';
+      if (!wastageByItem[key]) wastageByItem[key] = { name: key, total_loss: 0, count: 0 };
+      wastageByItem[key].total_loss += Number(w.cost_impact || w.total_cost || 0);
+      wastageByItem[key].count += 1;
+    }
+    const topWastage = Object.values(wastageByItem).sort((a, b) => b.total_loss - a.total_loss).slice(0, 5);
+
+    // 3. Profit Margin Optimization
+    const recipeMargins = recipes
+      .map((r) => {
+        const cost = Number(r.total_cost || r.cost_per_portion || 0);
+        const price = Number(r.selling_price || 0);
+        const margin = price > 0 ? ((price - cost) / price) * 100 : 0;
+        return {
+          id: r.id,
+          name: r.name,
+          cost,
+          price,
+          margin: parseFloat(margin.toFixed(1)),
+          is_low_margin: margin < 60 && price > 0,
+          recommendation: margin < 60 && price > 0 ? `Margin is ${margin.toFixed(0)}%. Consider increasing selling price to ₹${Math.round(cost / 0.35)} for target 65% gross margin.` : 'Healthy margin profile.',
+        };
+      })
+      .slice(0, 5);
+
+    // 4. Executive Summary KPI stats
+    const totalWastageLoss = wastage.reduce((sum, w) => sum + Number(w.cost_impact || w.total_cost || 0), 0);
+    const totalRevenue = sales.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+    const healthScore = Math.max(70, Math.min(98, 100 - runoutAlerts.length * 4 - (totalWastageLoss > 1000 ? 5 : 0)));
+
+    return res.json({
+      success: true,
+      data: {
+        health_score: healthScore,
+        runout_alerts: runoutAlerts,
+        top_wastage: topWastage,
+        total_wastage_loss: totalWastageLoss,
+        recipe_margins: recipeMargins,
+        total_sales_30d: totalRevenue,
+        order_count_30d: sales.length,
+      },
+    });
+  } catch (err: any) {
+    console.error('AI Insights error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to generate AI insights' });
   }
 });
 
@@ -2296,6 +3750,7 @@ app.get('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, 
   if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
 
   try {
+    const partner = await first('SELECT id, email, owner_name FROM partners WHERE id = $1', [partnerId]);
     const users = await db.query(
       `SELECT ru.id, ru.restaurant_id, ru.full_name, ru.email, ru.phone, ru.role, ru.status, ru.permissions, ru.branch_id, ru.created_at, ru.updated_at,
               b.name AS branch_name
@@ -2305,11 +3760,19 @@ app.get('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, 
        ORDER BY ru.created_at DESC`,
       [partnerId]
     );
+    const normalizedRows = users.rows.map(r => {
+      const isOwner = (r.role === 'owner' || (partner && (r.id === partner.id || r.auth_user_id === partner.id || (partner.email && r.email?.toLowerCase() === partner.email.toLowerCase()))));
+      return {
+        ...r,
+        role: isOwner ? 'owner' : (r.role || 'staff'),
+        permissions: isOwner ? ['*'] : (typeof r.permissions === 'string' ? JSON.parse(r.permissions) : r.permissions),
+      };
+    });
     return res.json({
       success: true,
-      data: users.rows,
-      users: users.rows,
-      count: users.rows.length,
+      data: normalizedRows,
+      users: normalizedRows,
+      count: normalizedRows.length,
     });
   } catch (err: any) {
     console.error('Error fetching restaurant users:', err);
@@ -2344,7 +3807,7 @@ app.get('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedReque
 app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest, res) => {
   const partnerId = req.userId;
   if (!partnerId) return res.status(401).json({ success: false, message: 'Authentication required' });
-  const { full_name, email, phone, role, branch_id, status, permissions } = req.body || {};
+  const { full_name, email, phone, password, role, branch_id, status, permissions } = req.body || {};
 
   // 1. Required string validation
   if (!full_name || typeof full_name !== 'string' || !full_name.trim()) {
@@ -2356,8 +3819,12 @@ app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest,
   if (!role || typeof role !== 'string' || !role.trim()) {
     return res.status(400).json({ success: false, message: 'Role is required.', code: 'INVALID_ROLE' });
   }
+  if (password !== undefined && (typeof password !== 'string' || password.length < 6)) {
+    return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.', code: 'INVALID_PASSWORD' });
+  }
 
   const emailLower = email.trim().toLowerCase();
+  const rawPassword = password ? String(password) : 'BhojMitra@123';
 
   try {
     // 2. Branch ownership validation
@@ -2406,8 +3873,9 @@ app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest,
        LIMIT 1`,
       [partnerId]
     );
-    const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
-    const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const rawPlanName = String(sub?.plan_name || sub?.plan || 'trial').toLowerCase().trim();
+    const planName = (rawPlanName === 'free trial' || rawPlanName === 'trial') ? 'trial' : rawPlanName;
+    const defaultUsers = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : planName === 'trial' ? 2 : 2;
     const maxUsers = Number(sub?.max_users ?? defaultUsers);
 
     const countRes = await db.query('SELECT COUNT(*) FROM restaurant_users WHERE restaurant_id = $1', [partnerId]);
@@ -2423,16 +3891,32 @@ app.post('/api/restaurant-users', requireAuth, async (req: AuthenticatedRequest,
       });
     }
 
+    // 5. Create or sync auth user in `users` table
+    const passwordHash = await bcrypt.hash(rawPassword, 12);
+    let authUserId: string;
+    const existingAuthUser = await first('SELECT id FROM users WHERE LOWER(email) = $1', [emailLower]);
+    if (existingAuthUser) {
+      authUserId = existingAuthUser.id;
+      if (password) {
+        await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, authUserId]);
+      }
+    } else {
+      authUserId = randomUUID();
+      await db.query('INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)', [authUserId, emailLower, passwordHash]);
+    }
+
     const id = randomUUID();
     const userStatus = status || 'active';
     const userPermissions = Array.isArray(permissions) ? permissions : [];
 
     const user = await first(
-      `INSERT INTO restaurant_users (id, restaurant_id, full_name, email, phone, role, status, permissions, branch_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO restaurant_users (id, restaurant_id, auth_user_id, full_name, email, phone, role, status, permissions, branch_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
-      [id, partnerId, full_name.trim(), emailLower, phone ? String(phone).trim() : null, role.trim(), userStatus, JSON.stringify(userPermissions), branchIdValue]
+      [id, partnerId, authUserId, full_name.trim(), emailLower, phone ? String(phone).trim() : null, role.trim(), userStatus, JSON.stringify(userPermissions), branchIdValue]
     );
+
+    logAdminActivity(partnerId, partnerId, full_name.trim(), 'Staff Added', 'user', id, `Staff member '${full_name.trim()}' (${role}) added`, req.ip);
 
     return res.status(201).json({
       success: true,
@@ -2460,7 +3944,7 @@ app.patch('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedReq
     );
     if (!existing) return res.status(404).json({ success: false, message: 'User not found' });
 
-    const { full_name, email, phone, role, branch_id, status, permissions } = req.body || {};
+    const { full_name, email, phone, password, role, branch_id, status, permissions } = req.body || {};
 
     let updatedName = existing.full_name;
     if (full_name !== undefined) {
@@ -2504,10 +3988,47 @@ app.patch('/api/restaurant-users/:id', requireAuth, async (req: AuthenticatedReq
       }
     }
 
+    // Password update handling
+    if (password !== undefined && password !== null && String(password).trim()) {
+      if (typeof password !== 'string' || password.length < 6) {
+        return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.', code: 'INVALID_PASSWORD' });
+      }
+      const newHash = await bcrypt.hash(password, 12);
+      if (existing.auth_user_id) {
+        await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, existing.auth_user_id]);
+      } else {
+        const existingAuth = await first('SELECT id FROM users WHERE LOWER(email) = $1', [updatedEmail]);
+        if (existingAuth) {
+          await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, existingAuth.id]);
+          await db.query('UPDATE restaurant_users SET auth_user_id = $1 WHERE id = $2', [existingAuth.id, id]);
+        } else {
+          const newAuthId = randomUUID();
+          await db.query('INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)', [newAuthId, updatedEmail, newHash]);
+          await db.query('UPDATE restaurant_users SET auth_user_id = $1 WHERE id = $2', [newAuthId, id]);
+        }
+      }
+    }
+
+    const partner = await first('SELECT id, email FROM partners WHERE id = $1', [partnerId]);
+    const isTargetOwner = (existing.role === 'owner' || existing.id === partnerId || existing.auth_user_id === partnerId || (partner?.email && existing.email?.toLowerCase() === partner.email.toLowerCase()));
+
     const updatedPhone = phone !== undefined ? (phone ? String(phone).trim() : null) : existing.phone;
-    const updatedRole = role !== undefined ? String(role).trim() : existing.role;
+    let updatedRole = existing.role;
+    if (role !== undefined) {
+      const cleanRole = String(role).trim().toLowerCase();
+      if (isTargetOwner) {
+        updatedRole = 'owner';
+      } else if (cleanRole === 'owner') {
+        return res.status(400).json({ success: false, message: 'Owner role cannot be assigned to staff members.', code: 'INVALID_ROLE' });
+      } else {
+        updatedRole = cleanRole;
+      }
+    } else if (isTargetOwner) {
+      updatedRole = 'owner';
+    }
+
     const updatedStatus = status !== undefined ? String(status).trim() : existing.status;
-    const updatedPermissions = permissions !== undefined ? (Array.isArray(permissions) ? permissions : existing.permissions) : existing.permissions;
+    const updatedPermissions = isTargetOwner ? ['*'] : (permissions !== undefined ? (Array.isArray(permissions) ? permissions : existing.permissions) : existing.permissions);
 
     const updated = await first(
       `UPDATE restaurant_users
@@ -2628,8 +4149,9 @@ app.post('/api/branches', requireAuth, async (req: AuthenticatedRequest, res) =>
        LIMIT 1`,
       [partnerId]
     );
-    const planName = (sub?.plan_name || sub?.plan || 'basic').toLowerCase();
-    const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : 2;
+    const rawPlanName = String(sub?.plan_name || sub?.plan || 'basic').toLowerCase().trim();
+    const planName = (rawPlanName === 'free trial' || rawPlanName === 'trial') ? 'trial' : rawPlanName;
+    const defaultBranches = planName === 'pro' ? 9999 : planName === 'basic' ? 5 : planName === 'starter' ? 3 : planName === 'trial' ? 1 : 1;
     const maxBranches = Number(sub?.max_branches ?? defaultBranches);
 
     const countRes = await db.query('SELECT COUNT(*) FROM branches WHERE restaurant_id = $1', [partnerId]);
@@ -2664,6 +4186,8 @@ app.post('/api/branches', requireAuth, async (req: AuthenticatedRequest, res) =>
         status || 'active',
       ]
     );
+
+    logAdminActivity(partnerId, partnerId, manager_name || 'Owner', 'Branch Created', 'branch', id, `Branch '${name.trim()}' added (${city || 'India'})`, req.ip);
 
     return res.status(201).json({ success: true, data: branch, branch, message: 'Branch created successfully.' });
   } catch (err: any) {
@@ -3212,6 +4736,644 @@ app.delete('/api/suppliers/:id', requireAuth, async (req: AuthenticatedRequest, 
   } catch (err: any) {
     console.error('Error in DELETE /api/suppliers/:id:', err);
     return res.status(500).json({ success: false, message: 'Unable to process supplier request' });
+  }
+});
+
+// ============================================================
+// SUPER ADMIN PORTAL API ENDPOINTS
+// ============================================================
+
+// 1. Dashboard Master KPIs & Charts
+app.get('/api/admin/dashboard/stats', async (_req, res) => {
+  try {
+    const totalRestoRes = await db.query('SELECT COUNT(*) FROM partners');
+    const activeRestoRes = await db.query("SELECT COUNT(*) FROM partners WHERE status = 'active' OR onboarding_completed = true");
+    const trialSubRes = await db.query("SELECT COUNT(*) FROM subscriptions WHERE status = 'trial'");
+    const expiredSubRes = await db.query("SELECT COUNT(*) FROM subscriptions WHERE status = 'expired'");
+    const suspendedRes = await db.query("SELECT COUNT(*) FROM partners WHERE status = 'suspended'");
+    
+    // Revenue from active subscriptions
+    const subRevRes = await db.query(`
+      SELECT COALESCE(SUM(COALESCE(s.amount, sp.price, 0)), 0)::numeric as mrr 
+      FROM subscriptions s 
+      LEFT JOIN subscription_plans sp ON LOWER(s.plan) = LOWER(sp.name) 
+      WHERE s.status IN ('active', 'trial')
+    `);
+    
+    // Total platform GMV from sales_orders
+    const ordersRes = await db.query("SELECT COUNT(*) as order_count, COALESCE(SUM(total_amount), 0)::numeric as total_sales FROM sales_orders WHERE created_at >= NOW() - INTERVAL '30 days'");
+
+    // Pending payments from invoices
+    const pendingPaymentsRes = await db.query("SELECT COALESCE(SUM(amount), 0)::numeric as pending FROM invoices WHERE status = 'pending'");
+
+    // Plan distribution
+    const planDistRes = await db.query(`
+      SELECT COALESCE(INITCAP(s.plan), 'Starter') as label, COUNT(*)::int as value
+      FROM subscriptions s
+      GROUP BY COALESCE(INITCAP(s.plan), 'Starter')
+      ORDER BY value DESC
+    `);
+
+    // Recent 5 restaurants
+    const recentRestos = await db.query(`
+      SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email, p.phone,
+             TO_CHAR(p.created_at, 'YYYY-MM-DD') as created,
+             p.city, p.business_type as "businessType",
+             COALESCE(p.status, 'active') as status,
+             COALESCE(s.plan, 'Starter') as plan, COALESCE(s.status, 'active') as "subStatus"
+      FROM partners p
+      LEFT JOIN subscriptions s ON p.id = s.partner_id
+      ORDER BY p.created_at DESC LIMIT 5
+    `);
+
+    // Recent payments / orders
+    const recentPayments = await db.query(`
+      SELECT o.id, o.order_number as invoice, o.total_amount as amount, o.payment_mode as method,
+             'Completed' as status, TO_CHAR(o.created_at, 'YYYY-MM-DD') as date, p.restaurant_name as restaurant
+      FROM sales_orders o
+      LEFT JOIN partners p ON o.restaurant_id = p.id
+      ORDER BY o.created_at DESC LIMIT 5
+    `);
+
+    // Recent activity logs
+    const recentActivityLogs = await db.query(`
+      SELECT a.id, COALESCE(p.restaurant_name, 'System') as restaurant,
+             COALESCE(u.full_name, a.user_name, 'Admin') as user, a.action, a.description as detail,
+             a.ip_address as ip,
+             'Success' as status,
+             TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI') as timestamp,
+             a.created_at as date
+      FROM activity_logs a
+      LEFT JOIN partners p ON a.restaurant_id = p.id
+      LEFT JOIN restaurant_users u ON a.user_id = u.id
+      ORDER BY a.created_at DESC LIMIT 6
+    `);
+
+    // Dynamic monthly series for charts
+    const monthlySeriesRes = await db.query(`
+      WITH months AS (
+        SELECT generate_series(
+          DATE_TRUNC('month', NOW() - INTERVAL '5 months'),
+          DATE_TRUNC('month', NOW()),
+          '1 month'::interval
+        ) as m
+      )
+      SELECT TO_CHAR(months.m, 'Mon') as label,
+             COALESCE((SELECT COUNT(*)::int FROM partners WHERE DATE_TRUNC('month', created_at) = months.m), 0) as new_restaurants,
+             COALESCE((SELECT SUM(total_amount)::numeric FROM sales_orders WHERE DATE_TRUNC('month', created_at) = months.m), 0) as sales,
+             COALESCE((SELECT COUNT(*)::int FROM subscriptions WHERE created_at <= months.m + INTERVAL '1 month' AND status IN ('active', 'trial')), 0) as subs
+      FROM months
+      ORDER BY months.m ASC
+    `);
+
+    const newRestaurantsSeries = monthlySeriesRes.rows.map(r => ({ label: r.label, value: Number(r.new_restaurants) }));
+    const revenueSeries = monthlySeriesRes.rows.map(r => ({
+      label: r.label,
+      value: Number(r.sales || 0)
+    }));
+    const subGrowthSeries = monthlySeriesRes.rows.map(r => ({ label: r.label, value: Number(r.subs) }));
+
+    // Expiring subscriptions
+    const expiringRestos = await db.query(`
+      SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email,
+             COALESCE(s.plan, 'Starter') as plan,
+             TO_CHAR(s.expiry_date, 'YYYY-MM-DD') as "subExpiry",
+             COALESCE(s.status, 'active') as "subStatus"
+      FROM partners p
+      JOIN subscriptions s ON p.id = s.partner_id
+      WHERE s.expiry_date IS NOT NULL
+      ORDER BY s.expiry_date ASC LIMIT 5
+    `);
+
+    // Open support tickets
+    const openTicketsRes = await db.query(`
+      SELECT t.id, t.ticket_number as "ticketId", COALESCE(p.restaurant_name, 'Partner') as restaurant,
+             t.subject, t.priority, t.status,
+             TO_CHAR(t.created_at, 'YYYY-MM-DD') as created
+      FROM support_tickets t
+      LEFT JOIN partners p ON t.partner_id = p.id
+      ORDER BY t.created_at DESC LIMIT 5
+    `);
+
+    const mrr = Number(subRevRes.rows[0]?.mrr || 0);
+    const monthlyRevenue = Number(ordersRes.rows[0]?.total_sales || 0);
+    const pendingPayments = Number(pendingPaymentsRes.rows[0]?.pending || 0);
+    const totalRestaurants = parseInt(totalRestoRes.rows[0]?.count || '0', 10);
+    const activeRestaurants = parseInt(activeRestoRes.rows[0]?.count || '0', 10);
+    const trialRestaurants = parseInt(trialSubRes.rows[0]?.count || '0', 10);
+    const expired = parseInt(expiredSubRes.rows[0]?.count || '0', 10);
+    const suspended = parseInt(suspendedRes.rows[0]?.count || '0', 10);
+
+    return res.json({
+      success: true,
+      data: {
+        kpis: {
+          totalRestaurants,
+          activeRestaurants,
+          trialRestaurants,
+          expired,
+          suspended,
+          mrr,
+          monthlyRevenue,
+          pendingPayments,
+        },
+        planDistribution: planDistRes.rows.length > 0 ? planDistRes.rows.map((p, idx) => ({
+          ...p,
+          color: idx === 0 ? '#166534' : idx === 1 ? '#ea580c' : idx === 2 ? '#f59e0b' : '#10b981'
+        })) : [
+          { label: 'Starter', value: 0, color: '#166534' },
+          { label: 'Growth', value: 0, color: '#ea580c' },
+          { label: 'Pro', value: 0, color: '#f59e0b' },
+        ],
+        recentRestaurants: recentRestos.rows,
+        recentPayments: recentPayments.rows,
+        recentActivity: recentActivityLogs.rows,
+        expiringRestaurants: expiringRestos.rows,
+        openTickets: openTicketsRes.rows,
+        revenueSeries,
+        newRestaurantsSeries,
+        subGrowthSeries,
+      }
+    });
+  } catch (err: any) {
+    console.error('Error in /api/admin/dashboard/stats:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Restaurants Management
+app.get('/api/admin/restaurants', async (req, res) => {
+  try {
+    const { search = '', status = 'all' } = req.query as any;
+    let query = `
+      SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email, p.phone,
+             p.city, COALESCE(p.city, 'India') as address, p.gst_number, p.business_type as "businessType",
+             COALESCE(p.status, 'active') as status,
+             TO_CHAR(p.created_at, 'YYYY-MM-DD') as created,
+             COALESCE(s.plan, 'Starter') as plan,
+             COALESCE(s.status, 'active') as "subStatus",
+             TO_CHAR(s.expiry_date, 'YYYY-MM-DD') as "subExpiry",
+             (SELECT COUNT(*) FROM branches b WHERE b.restaurant_id = p.id)::int as branches,
+             (SELECT COUNT(*) FROM restaurant_users u WHERE u.restaurant_id = p.id)::int as users,
+             COALESCE((SELECT SUM(total_amount) FROM sales_orders o WHERE o.restaurant_id = p.id), 0)::numeric as total_gmv
+      FROM partners p
+      LEFT JOIN subscriptions s ON p.id = s.partner_id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+    if (search) {
+      params.push(`%${search}%`);
+      query += ` AND (p.restaurant_name ILIKE $${params.length} OR p.owner_name ILIKE $${params.length} OR p.email ILIKE $${params.length} OR p.phone ILIKE $${params.length})`;
+    }
+    if (status !== 'all') {
+      params.push(status);
+      query += ` AND LOWER(p.status) = LOWER($${params.length})`;
+    }
+    query += ` ORDER BY p.created_at DESC`;
+
+    const r = await db.query(query, params);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    console.error('Error in /api/admin/restaurants:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Single Restaurant Profile & Detailed Stats
+app.get('/api/admin/restaurants/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const partner = await first(`
+      SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email, p.phone,
+             p.city, COALESCE(p.city, 'India') as address, p.gst_number, p.business_type as "businessType",
+             COALESCE(p.status, 'active') as status,
+             TO_CHAR(p.created_at, 'YYYY-MM-DD') as created,
+             COALESCE(s.plan, 'Starter') as plan,
+             COALESCE(s.status, 'active') as "subStatus",
+             TO_CHAR(s.start_date, 'YYYY-MM-DD') as "subStartDate",
+             TO_CHAR(s.expiry_date, 'YYYY-MM-DD') as "subExpiry",
+             COALESCE(s.amount, 799) as "subAmount",
+             COALESCE(s.billing_cycle, 'Monthly') as "subCycle",
+             COALESCE(s.auto_renew, true) as "subAutoRenew"
+      FROM partners p
+      LEFT JOIN subscriptions s ON p.id = s.partner_id
+      WHERE p.id = $1
+    `, [id]);
+    if (!partner) return res.status(404).json({ error: 'Restaurant not found' });
+
+    const [branches, users, orders, logs, tickets, counts] = await Promise.all([
+      db.query(`
+        SELECT b.id, b.name, b.code, b.city, b.state, b.phone, b.manager_name as manager,
+               COALESCE(b.status, 'Active') as status,
+               (SELECT COUNT(*) FROM restaurant_users u WHERE u.branch_id = b.id)::int as users,
+               (SELECT COUNT(*) FROM inventory_items i WHERE i.branch_id = b.id)::int as "inventoryItems"
+        FROM branches b
+        WHERE b.restaurant_id = $1
+        ORDER BY b.created_at DESC
+      `, [id]),
+      db.query(`
+        SELECT u.id, u.full_name as name, u.email, u.phone, u.role,
+               COALESCE(u.status, 'Active') as status,
+               TO_CHAR(u.created_at, 'YYYY-MM-DD') as created
+        FROM restaurant_users u
+        WHERE u.restaurant_id = $1
+        ORDER BY u.created_at DESC
+      `, [id]),
+      db.query(`
+        SELECT o.id, o.order_number as invoice, o.total_amount as amount,
+               o.payment_mode as method, 'Completed' as status,
+               TO_CHAR(o.created_at, 'YYYY-MM-DD') as date
+        FROM sales_orders o
+        WHERE o.restaurant_id = $1
+        ORDER BY o.created_at DESC LIMIT 20
+      `, [id]),
+      db.query(`
+        SELECT a.id, a.user_name as user, a.action, a.description as detail,
+               a.ip_address as ip, 'Success' as status,
+               TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI') as timestamp,
+               a.created_at as date
+        FROM activity_logs a
+        WHERE a.restaurant_id = $1
+        ORDER BY a.created_at DESC LIMIT 20
+      `, [id]),
+      db.query(`
+        SELECT t.id, t.ticket_number as "ticketId", t.subject, t.priority, t.status,
+               TO_CHAR(t.created_at, 'YYYY-MM-DD') as created
+        FROM support_tickets t
+        WHERE t.partner_id = $1
+        ORDER BY t.created_at DESC LIMIT 10
+      `, [id]),
+      db.query(`
+        SELECT (SELECT COUNT(*) FROM inventory_items WHERE restaurant_id = $1)::int as inventory_count,
+               (SELECT COUNT(*) FROM dining_tables WHERE restaurant_id = $1)::int as table_count,
+               (SELECT COALESCE(SUM(total_amount), 0) FROM sales_orders WHERE restaurant_id = $1)::numeric as total_gmv,
+               (SELECT COUNT(*) FROM sales_orders WHERE restaurant_id = $1)::int as total_orders
+      `, [id]),
+    ]);
+
+    return res.json({
+      success: true,
+      data: {
+        restaurant: partner,
+        branches: branches.rows,
+        users: users.rows,
+        payments: orders.rows,
+        activityLogs: logs.rows,
+        tickets: tickets.rows,
+        stats: counts.rows[0] || {},
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Create Restaurant from Super Admin
+app.post('/api/admin/restaurants', async (req, res) => {
+  const { name, owner, email, phone, city, cuisine = 'restaurant', plan = 'Growth', branches = 1 } = req.body;
+  if (!name || !owner || !email) {
+    return res.status(400).json({ error: 'Name, owner, and email are required' });
+  }
+  try {
+    const id = randomUUID();
+    const emailLower = String(email).trim().toLowerCase();
+    const hash = await bcrypt.hash('Password123!', 10);
+    await db.query('INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)', [id, emailLower, hash]);
+    await db.query(
+      `INSERT INTO partners (id, owner_name, restaurant_name, email, phone, city, business_type, status, onboarding_completed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', true)`,
+      [id, owner.trim(), name.trim(), emailLower, phone ? String(phone).trim() : null, city || 'India', cuisine?.toLowerCase() || 'restaurant']
+    );
+    const mainBranchId = randomUUID();
+    await db.query(
+      `INSERT INTO branches (id, restaurant_id, name, code, city, status)
+       VALUES ($1, $2, 'Main Branch', 'MAIN', $3, 'active')`,
+      [mainBranchId, id, city || 'India']
+    );
+    await db.query(
+      `INSERT INTO restaurant_users (id, restaurant_id, auth_user_id, full_name, email, phone, role, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'owner', 'active')`,
+      [id, id, id, owner.trim(), emailLower, phone ? String(phone).trim() : null]
+    );
+    await db.query(
+      `INSERT INTO subscriptions (id, partner_id, plan, billing_cycle, status, start_date, expiry_date, auto_renew, amount)
+       VALUES ($1, $2, $3, 'monthly', 'active', NOW(), NOW() + INTERVAL '30 days', TRUE, $4)`,
+      [randomUUID(), id, plan.toLowerCase(), plan.toLowerCase() === 'pro' ? 2999 : plan.toLowerCase() === 'starter' ? 799 : 1499]
+    );
+    logAdminActivity(id, id, owner.trim(), 'Restaurant Registered', 'partner', id, `New restaurant '${name.trim()}' added via Super Admin`, req.ip);
+    return res.status(201).json({ success: true, message: 'Restaurant created successfully', id });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Toggle Restaurant Status
+app.patch('/api/admin/restaurants/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const normalizedStatus = String(status || 'active').toLowerCase() === 'suspended' ? 'suspended' : 'active';
+    await db.query('UPDATE partners SET status = $1, updated_at = NOW() WHERE id = $2', [normalizedStatus, id]);
+    await db.query('UPDATE restaurant_users SET status = $1, updated_at = NOW() WHERE restaurant_id = $2', [normalizedStatus, id]);
+    if (normalizedStatus === 'suspended') {
+      await db.query('UPDATE subscriptions SET status = $1 WHERE partner_id = $2', ['suspended', id]);
+    } else {
+      await db.query('UPDATE subscriptions SET status = $1 WHERE partner_id = $2 AND status = $3', ['active', id, 'suspended']);
+    }
+    await logAdminActivity(id, id, 'Super Admin', 'Restaurant Status Updated', 'partner', id, `Restaurant #${id.slice(0, 8)} status set to ${normalizedStatus}`, req.ip);
+    return res.json({ success: true, message: `Restaurant status updated to ${normalizedStatus}` });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Subscriptions List
+app.get('/api/admin/subscriptions', async (_req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT s.id, s.partner_id as "restaurantId", p.restaurant_name as "restaurantName",
+             p.email, COALESCE(s.plan, 'Starter') as plan,
+             COALESCE(s.status, 'active') as status,
+             TO_CHAR(s.start_date, 'YYYY-MM-DD') as "startDate",
+             TO_CHAR(s.expiry_date, 'YYYY-MM-DD') as "expiryDate",
+             s.auto_renew as "autoRenew",
+             (SELECT COUNT(*) FROM branches b WHERE b.restaurant_id = p.id)::int as "branchesCount",
+             (SELECT COUNT(*) FROM restaurant_users u WHERE u.restaurant_id = p.id)::int as "usersCount"
+      FROM subscriptions s
+      JOIN partners p ON s.partner_id = p.id
+      ORDER BY s.created_at DESC
+    `);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 5. Plans
+app.get('/api/admin/plans', async (_req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT sp.*, 
+             (SELECT COUNT(*)::int FROM subscriptions s WHERE LOWER(s.plan) = LOWER(sp.name)) as "restaurantsCount"
+      FROM subscription_plans sp 
+      ORDER BY sp.id ASC
+    `);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 6. Payments
+app.get('/api/admin/payments', async (_req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT o.id, o.order_number as invoice, p.restaurant_name as "restaurantName",
+             o.total_amount as amount, o.payment_mode as method, 'Completed' as status,
+             TO_CHAR(o.created_at, 'YYYY-MM-DD') as date
+      FROM sales_orders o
+      LEFT JOIN partners p ON o.restaurant_id = p.id
+      ORDER BY o.created_at DESC LIMIT 50
+    `);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 7. Invoices
+app.get('/api/admin/invoices', async (_req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT o.id, o.order_number as "invoiceNumber", p.restaurant_name as "restaurantName",
+             p.email as "customerEmail", o.total_amount as amount,
+             TO_CHAR(o.created_at, 'YYYY-MM-DD') as "issueDate",
+             TO_CHAR(o.created_at + INTERVAL '30 days', 'YYYY-MM-DD') as "dueDate",
+             'Paid' as status
+      FROM sales_orders o
+      LEFT JOIN partners p ON o.restaurant_id = p.id
+      ORDER BY o.created_at DESC LIMIT 50
+    `);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. Users List & Status
+app.get('/api/admin/users', async (_req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT u.id, u.full_name as name, u.email, u.phone, u.role,
+             p.restaurant_name as "restaurantName",
+             TO_CHAR(u.created_at, 'YYYY-MM-DD') as created,
+             COALESCE(u.status, p.status, 'active') as status
+      FROM restaurant_users u
+      LEFT JOIN partners p ON u.restaurant_id = p.id
+      ORDER BY u.created_at DESC
+    `);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/admin/users/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const normalizedStatus = String(status || 'active').toLowerCase() === 'suspended' ? 'suspended' : 'active';
+    
+    // 1. Update restaurant_users
+    await db.query('UPDATE restaurant_users SET status = $1, updated_at = NOW() WHERE id = $2 OR auth_user_id = $2', [normalizedStatus, id]);
+    
+    // 2. Update partners if this user is a partner
+    await db.query('UPDATE partners SET status = $1, updated_at = NOW() WHERE id = $2', [normalizedStatus, id]);
+
+    // 3. Update subscriptions
+    if (normalizedStatus === 'suspended') {
+      await db.query('UPDATE subscriptions SET status = $1 WHERE partner_id = $2', ['suspended', id]);
+    } else {
+      await db.query('UPDATE subscriptions SET status = $1 WHERE partner_id = $2 AND status = $3', ['active', id, 'suspended']);
+    }
+
+    await logAdminActivity(id, id, 'Super Admin', 'User Status Updated', 'users', id, `User #${id.slice(0, 8)} status set to ${normalizedStatus}`, req.ip);
+
+    return res.json({ success: true, message: `User status updated to ${normalizedStatus}` });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 9. Branches
+app.get('/api/admin/branches', async (_req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT b.id, b.name, b.code, b.city, b.state, b.phone, b.manager_name as manager,
+             p.restaurant_name as "restaurantName",
+             (SELECT COUNT(*) FROM restaurant_users u WHERE u.branch_id = b.id)::int as users,
+             (SELECT COUNT(*) FROM inventory_items i WHERE i.branch_id = b.id)::int as "inventoryItems",
+             TO_CHAR(b.created_at, 'YYYY-MM-DD') as created,
+             COALESCE(b.status, 'Active') as status
+      FROM branches b
+      LEFT JOIN partners p ON b.restaurant_id = p.id
+      ORDER BY b.created_at DESC
+    `);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 10. Activity Logs
+app.get('/api/admin/activity-logs', async (_req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT a.id, COALESCE(p.restaurant_name, 'System') as restaurant,
+             COALESCE(u.full_name, 'Admin') as user, a.action, a.description as detail,
+             a.ip_address as ip,
+             TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI') as timestamp
+      FROM activity_logs a
+      LEFT JOIN partners p ON a.restaurant_id = p.id
+      LEFT JOIN restaurant_users u ON a.user_id = u.id
+      ORDER BY a.created_at DESC LIMIT 50
+    `);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 11. Support Tickets
+app.get('/api/admin/support-tickets', async (_req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT t.id, t.ticket_number as "ticketId", p.restaurant_name as restaurant,
+             t.subject, t.priority, t.status,
+             TO_CHAR(t.created_at, 'YYYY-MM-DD') as created,
+             TO_CHAR(t.updated_at, 'YYYY-MM-DD') as updated
+      FROM support_tickets t
+      LEFT JOIN partners p ON t.partner_id = p.id
+      ORDER BY t.created_at DESC LIMIT 50
+    `);
+    return res.json({ success: true, data: r.rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 12. Admin Leads (Demo requests & contact queries)
+app.get('/api/admin/leads', async (_req, res) => {
+  try {
+    const [demosRes, contactsRes] = await Promise.all([
+      db.query(`
+        SELECT id, name, restaurant_name as "restaurantName", email, phone, city,
+               number_of_branches as "branches", preferred_date as "preferredDate",
+               preferred_time as "preferredTime", message, reference_id as "referenceId",
+               COALESCE(status, 'new') as status, 'demo' as type,
+               TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI') as "createdFormatted",
+               created_at as created
+        FROM demo_requests
+        ORDER BY created_at DESC
+      `),
+      db.query(`
+        SELECT id, name, subject as "restaurantName", email, phone, 'India' as city,
+               1 as "branches", NULL as "preferredDate", NULL as "preferredTime",
+               message, reference_id as "referenceId",
+               COALESCE(status, 'new') as status, 'contact' as type,
+               TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI') as "createdFormatted",
+               created_at as created
+        FROM contact_queries
+        ORDER BY created_at DESC
+      `),
+    ]);
+
+    const allLeads = [...demosRes.rows, ...contactsRes.rows].sort((a, b) => new Date(b.created).getTime() - new Date(a.created).getTime());
+
+    const counts = {
+      total: allLeads.length,
+      new: allLeads.filter(l => l.status === 'new' || !l.status).length,
+      contacted: allLeads.filter(l => l.status === 'contacted').length,
+      converted: allLeads.filter(l => l.status === 'converted').length,
+      closed: allLeads.filter(l => l.status === 'closed' || l.status === 'rejected').length,
+    };
+
+    return res.json({ success: true, data: allLeads, counts });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Update Lead Status
+app.patch('/api/admin/leads/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, type } = req.body;
+    const validStatuses = ['new', 'contacted', 'converted', 'closed', 'rejected'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    if (type === 'contact') {
+      await db.query('UPDATE contact_queries SET status = $1 WHERE id = $2', [status, id]);
+    } else {
+      await db.query('UPDATE demo_requests SET status = $1 WHERE id = $2', [status, id]);
+    }
+
+    await logActivity(null, null, 'Super Admin', 'Lead Status Updated', 'leads', id, `Lead #${id.slice(0, 8)} updated to ${status}`);
+
+    return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 13. Admin Website Visitors & Live Presence
+app.get('/api/admin/website/visitors', async (_req, res) => {
+  try {
+    const [onlineRes, todayRes, totalRes, avgTimeRes, topPagesRes, streamRes] = await Promise.all([
+      db.query(`SELECT COUNT(*)::int as count FROM website_visitors WHERE is_online = TRUE AND last_heartbeat >= NOW() - INTERVAL '60 seconds'`),
+      db.query(`SELECT COUNT(*)::int as count FROM website_visitors WHERE created_at >= CURRENT_DATE`),
+      db.query(`SELECT COUNT(*)::int as count FROM website_visitors`),
+      db.query(`SELECT COALESCE(AVG(time_spent_seconds), 0)::int as avg_seconds FROM website_visitors`),
+      db.query(`
+        SELECT current_page as page, COUNT(*)::int as visits
+        FROM website_visitors
+        GROUP BY current_page
+        ORDER BY visits DESC LIMIT 6
+      `),
+      db.query(`
+        SELECT id, session_id as "sessionId", ip_address as ip, device_type as "deviceType",
+               browser, os, city, country, referrer, landing_page as "landingPage",
+               current_page as "currentPage", time_spent_seconds as "timeSpentSeconds",
+               (is_online = TRUE AND last_heartbeat >= NOW() - INTERVAL '60 seconds') as "isOnline",
+               TO_CHAR(last_heartbeat, 'YYYY-MM-DD HH24:MI:SS') as "lastHeartbeat",
+               TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI') as created
+        FROM website_visitors
+        ORDER BY last_heartbeat DESC LIMIT 50
+      `),
+    ]);
+
+    const onlineNow = onlineRes.rows[0]?.count || 0;
+    const totalToday = todayRes.rows[0]?.count || 0;
+    const totalVisits = totalRes.rows[0]?.count || 0;
+    const avgTimeSpent = avgTimeRes.rows[0]?.avg_seconds || 0;
+    const topPages = topPagesRes.rows || [];
+    const recentVisitors = streamRes.rows || [];
+
+    return res.json({
+      success: true,
+      data: {
+        onlineNow,
+        totalToday,
+        totalVisits,
+        avgTimeSpent,
+        topPages,
+        recentVisitors,
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
