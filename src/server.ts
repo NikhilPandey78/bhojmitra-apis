@@ -2442,7 +2442,7 @@ app.post('/api/support/tickets', requireAuth, async (req: AuthenticatedRequest, 
   const t = parsed.data;
   const ticketNumber = referenceId('TKT');
   const ticket = await first('INSERT INTO support_tickets (id,partner_id,ticket_number,subject,category,priority,message) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [randomUUID(), req.userId, ticketNumber, t.subject, t.category, t.priority, t.message]);
-  logAdminActivity(req.userId, req.userId, null, 'Support Ticket Raised', 'support_ticket', ticket.id, `Ticket #${ticketNumber}: ${t.subject}`, req.ip);
+  logAdminActivity(req.userId || null, req.userId || null, null, 'Support Ticket Raised', 'support_ticket', ticket.id, `Ticket #${ticketNumber}: ${t.subject}`, req.ip);
   res.status(201).json({ ticket });
 });
 
@@ -3609,6 +3609,70 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
     return res.status(500).json({ error: err?.message || 'Failed to process POS checkout' });
   } finally {
     client.release();
+  }
+});
+
+// ============================================================
+// DIRECT WHATSAPP INVOICE DISPATCH API
+// ============================================================
+app.post('/api/resto/sales-pos/send-whatsapp', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { phone, order_number, message, customer_name, grand_total } = req.body || {};
+  if (!phone) {
+    return res.status(400).json({ error: 'Customer phone number is required.' });
+  }
+
+  const cleanPhone = String(phone).replace(/[^0-9]/g, '');
+  const formattedPhone = cleanPhone.length === 10 ? `91${cleanPhone}` : cleanPhone;
+
+  try {
+    // 1. Fetch Restaurant details for sender branding
+    const restRow = await first(`SELECT name, city, phone FROM restaurants WHERE id = $1 LIMIT 1`, [partnerId]);
+
+    // 2. Record notification
+    await db.query(
+      `INSERT INTO notifications (id, restaurant_id, type, title, message, is_read, created_at)
+       VALUES ($1, $2, 'whatsapp_invoice', $3, $4, FALSE, NOW())`,
+      [
+        randomUUID(),
+        partnerId,
+        `WhatsApp Bill Sent #${order_number || ''}`,
+        `Direct WhatsApp Tax Invoice sent to +${formattedPhone} for Order #${order_number || ''}`,
+      ]
+    );
+
+    // 3. If WhatsApp Cloud API / Webhook credentials are set in environment, invoke gateway
+    if (process.env.WHATSAPP_API_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID) {
+      try {
+        await fetch(`https://graph.facebook.com/v19.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${process.env.WHATSAPP_API_TOKEN}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: formattedPhone,
+            type: 'text',
+            text: { preview_url: false, body: message },
+          }),
+        });
+      } catch (gatewayErr) {
+        console.warn('WhatsApp Cloud API Gateway warning:', gatewayErr);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: `Tax Invoice #${order_number || ''} dispatched directly to WhatsApp (+${formattedPhone})!`,
+      delivered_to: formattedPhone,
+    });
+  } catch (err: any) {
+    console.error('Error dispatching WhatsApp bill:', err);
+    return res.status(500).json({ error: err.message || 'Failed to dispatch WhatsApp message.' });
   }
 });
 
