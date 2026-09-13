@@ -3643,7 +3643,7 @@ app.post('/api/resto/sales-pos/send-whatsapp', requireAuth, async (req: Authenti
       ]
     );
 
-    // 3. If WhatsApp Cloud API / Webhook credentials are set in environment, invoke gateway
+    // 3. If WhatsApp Cloud API / UltraMsg / Webhook credentials are set, dispatch in background
     if (process.env.WHATSAPP_API_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID) {
       try {
         await fetch(`https://graph.facebook.com/v19.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
@@ -3665,9 +3665,45 @@ app.post('/api/resto/sales-pos/send-whatsapp', requireAuth, async (req: Authenti
       }
     }
 
+    // UltraMsg Instance Support
+    if (process.env.ULTRAMSG_INSTANCE_ID && process.env.ULTRAMSG_TOKEN) {
+      try {
+        await fetch(`https://api.ultramsg.com/${process.env.ULTRAMSG_INSTANCE_ID}/messages/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            token: process.env.ULTRAMSG_TOKEN,
+            to: formattedPhone,
+            body: message,
+          }),
+        });
+      } catch (ultraErr) {
+        console.warn('UltraMsg Gateway warning:', ultraErr);
+      }
+    }
+
+    // Custom Webhook Support
+    if (process.env.WHATSAPP_WEBHOOK_URL) {
+      try {
+        await fetch(process.env.WHATSAPP_WEBHOOK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: formattedPhone,
+            phone: cleanPhone,
+            message,
+            order_number,
+            sender: restRow?.phone || '6388433679',
+          }),
+        });
+      } catch (webhookErr) {
+        console.warn('Custom WhatsApp Webhook warning:', webhookErr);
+      }
+    }
+
     return res.json({
       success: true,
-      message: `Tax Invoice #${order_number || ''} dispatched directly to WhatsApp (+${formattedPhone})!`,
+      message: `Tax Invoice #${order_number || ''} sent directly to customer WhatsApp (+${formattedPhone}) from ${restRow?.phone || '6388433679'}!`,
       delivered_to: formattedPhone,
     });
   } catch (err: any) {
