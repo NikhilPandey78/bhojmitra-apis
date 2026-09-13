@@ -83,7 +83,7 @@ export const MENU_ITEMS_CATALOG = [
   { name: 'Mineral Water (1 Litre)', category: 'Beverages', price: 20, cost: 12, is_veg: true, desc: 'Packaged chilled drinking water bottle.' },
 
   // Thalis & Combos
-  { name: 'BhojMitra Royal Special Thali', category: 'Thalis', price: 280, cost: 95, is_veg: true, desc: 'Paneer Butter Masala, Dal Makhani, Mix Veg, Jeera Rice, 2 Butter Naan, Raita, Salad, Papad & Gulab Jamun.' },
+  { name: 'Chef Special Royal Thali', category: 'Thalis', price: 280, cost: 95, is_veg: true, desc: 'Paneer Butter Masala, Dal Makhani, Mix Veg, Jeera Rice, 2 Butter Naan, Raita, Salad, Papad & Gulab Jamun.' },
   { name: 'Deluxe Veg Thali', category: 'Thalis', price: 210, cost: 70, is_veg: true, desc: 'Paneer dish, Yellow Dal Tadka, Seasonal Sabzi, Steamed Rice, 3 Butter Roti, Salad & Pickle.' },
   { name: 'Executive Non-Veg Thali', category: 'Thalis', price: 340, cost: 125, is_veg: false, desc: 'Butter Chicken, Dal Makhani, Chicken Biryani Rice, 2 Butter Naan, Raita, Salad & Gulab Jamun.' }
 ];
