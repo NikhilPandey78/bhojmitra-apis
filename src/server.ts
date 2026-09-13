@@ -5542,42 +5542,180 @@ app.get('/api/public/menu/:restaurantId', async (req, res) => {
 app.post('/api/public/orders/place', async (req, res) => {
   try {
     const { restaurant_id, table_number, customer_name, customer_phone, items, notes, order_type } = req.body;
-    if (!restaurant_id || !items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ success: false, message: 'Invalid order payload' });
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: 'Invalid order payload: items list is required' });
     }
 
+    // Resolve partner
+    let partner = await first(
+      `SELECT id, restaurant_name, business_name FROM partners WHERE id = $1`,
+      [restaurant_id]
+    );
+
+    if (!partner) {
+      partner = await first(`SELECT id, restaurant_name, business_name FROM partners ORDER BY created_at DESC LIMIT 1`);
+    }
+
+    if (!partner) {
+      return res.status(404).json({ success: false, message: 'Restaurant not found' });
+    }
+
+    const partnerId = partner.id;
+
+    // Find table if provided
+    let tableRow = null;
+    if (table_number) {
+      const tableQuery = await db.query(
+        `SELECT id, table_number, name, section FROM dining_tables 
+         WHERE restaurant_id = $1 AND (table_number = $2 OR name ILIKE $3 OR table_number ILIKE $3) LIMIT 1`,
+        [partnerId, table_number, `%${table_number}%`]
+      );
+      if (tableQuery.rows.length > 0) {
+        tableRow = tableQuery.rows[0];
+      }
+    }
+
+    const orderId = randomUUID();
+    const kotId = randomUUID();
     const orderNum = `ORD-${Date.now().toString().slice(-4)}`;
-    const subtotal = items.reduce((sum: number, it: any) => sum + (Number(it.price || it.selling_price || 0) * Number(it.quantity || 1)), 0);
+    const kotNumber = `KOT-${Date.now().toString().slice(-4)}`;
+    
+    const subtotal = items.reduce((sum: number, it: any) => {
+      const p = Number(it.price || it.selling_price || 0);
+      const q = Number(it.quantity || 1);
+      return sum + (p * q);
+    }, 0);
     const taxAmount = Math.round((subtotal * 0.05) * 100) / 100;
     const grandTotal = subtotal + taxAmount;
+    const finalTableName = tableRow ? tableRow.name : (table_number ? `Table ${table_number}` : 'Table Order');
+    const finalTableNum = tableRow ? tableRow.table_number : (table_number || 'T1');
 
-    // Create sales order
+    // 1. Insert sales_orders
     await db.query(
       `INSERT INTO sales_orders (
-        id, restaurant_id, order_number, order_type, customer_name, customer_phone,
+        id, restaurant_id, table_id, table_name, order_number, order_type, customer_name, customer_phone,
         subtotal, tax_amount, tax_percent, total_amount, payment_mode, payment_status, notes, status, created_at, updated_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, 5, $9, 'pending', 'unpaid', $10, 'pending', NOW(), NOW()
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 5, $11, 'pending', 'unpaid', $12, 'pending', NOW(), NOW()
       )`,
       [
-        `ord-${Date.now()}`,
-        restaurant_id,
+        orderId,
+        partnerId,
+        tableRow ? tableRow.id : null,
+        finalTableName,
         orderNum,
         order_type || 'dine_in',
-        customer_name || 'Table Guest',
+        customer_name || `${finalTableName} Guest`,
         customer_phone || null,
         subtotal,
         taxAmount,
         grandTotal,
-        `[Customer Table Order ${table_number ? `T-${table_number}` : ''}] ${notes || ''}`
+        `[Customer QR Table Order - ${finalTableName}] ${notes || ''}`
+      ]
+    );
+
+    // 2. Insert sales_order_items
+    for (const itm of items) {
+      const itmId = randomUUID();
+      const qty = Number(itm.quantity || 1);
+      const rate = Number(itm.price || itm.selling_price || 0);
+      const lineTotal = rate * qty;
+
+      let validMenuItemId: string | null = null;
+      const targetId = itm.id || itm.menu_item_id;
+      if (targetId) {
+        const check = await db.query('SELECT id FROM menu_items WHERE id = $1 AND restaurant_id = $2 LIMIT 1', [targetId, partnerId]);
+        if (check.rows.length > 0) {
+          validMenuItemId = check.rows[0].id;
+        }
+      }
+
+      await db.query(
+        `INSERT INTO sales_order_items
+         (id, sales_order_id, restaurant_id, menu_item_id, item_name, quantity, unit_price, tax_percent, total_price, notes, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 5, $8, $9, NOW())`,
+        [
+          itmId,
+          orderId,
+          partnerId,
+          validMenuItemId,
+          itm.name || itm.item_name || 'Dish Item',
+          qty,
+          rate,
+          lineTotal,
+          itm.notes || null,
+        ]
+      );
+    }
+
+    // 3. Insert KOT Ticket
+    await db.query(
+      `INSERT INTO kot_tickets
+       (id, restaurant_id, table_id, table_number, table_name, sales_order_id, kot_number, order_type, server_name, status, notes, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, NOW(), NOW())`,
+      [
+        kotId,
+        partnerId,
+        tableRow ? tableRow.id : null,
+        finalTableNum,
+        finalTableName,
+        orderId,
+        kotNumber,
+        'dine_in',
+        'Customer QR Order',
+        `[QR Order] ${notes || 'Freshly ordered from table'}`,
+      ]
+    );
+
+    // 4. Insert KOT Items
+    for (const itm of items) {
+      await db.query(
+        `INSERT INTO kot_items (id, kot_id, restaurant_id, item_name, quantity, unit, notes, status)
+         VALUES ($1, $2, $3, $4, $5, 'portion', $6, 'pending')`,
+        [
+          randomUUID(),
+          kotId,
+          partnerId,
+          itm.name || itm.item_name || 'Dish Item',
+          Number(itm.quantity || 1),
+          itm.notes || null,
+        ]
+      );
+    }
+
+    // 5. Update Dining Table status to occupied
+    if (tableRow) {
+      await db.query(
+        `UPDATE dining_tables SET status = 'occupied', current_order_id = $1, updated_at = NOW() WHERE id = $2`,
+        [orderId, tableRow.id]
+      );
+    }
+
+    // 6. Insert live notification for partner
+    await db.query(
+      `INSERT INTO notifications (id, restaurant_id, partner_id, type, title, message, is_read, link, created_at, updated_at)
+       VALUES ($1, $2, $3, 'order', $4, $5, false, '/kot', NOW(), NOW())`,
+      [
+        randomUUID(),
+        partnerId,
+        partnerId,
+        `🛎️ New Table Order: ${finalTableName}`,
+        `${customer_name || 'Guest'} at ${finalTableName} ordered ${items.length} dishes (₹${grandTotal.toFixed(2)}).`,
       ]
     );
 
     return res.json({
       success: true,
-      message: `Order #${orderNum} placed successfully! The kitchen is preparing your dishes.`,
+      message: `Order #${orderNum} received! Sent to kitchen.`,
+      order_id: orderId,
       order_number: orderNum,
+      kot_number: kotNumber,
+      table_number: finalTableNum,
+      table_name: finalTableName,
+      subtotal,
+      tax_amount: taxAmount,
       grand_total: grandTotal,
+      item_count: items.length,
     });
   } catch (err: any) {
     console.error('Error placing public table order:', err);
