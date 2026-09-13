@@ -5,7 +5,14 @@ import { config } from '../config.js';
 import { db } from '../db.js';
 
 export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  if (req.path?.startsWith('/admin') || req.baseUrl?.startsWith('/api/admin') || req.originalUrl?.startsWith('/api/admin')) {
+  if (
+    req.path?.startsWith('/admin') ||
+    req.baseUrl?.startsWith('/api/admin') ||
+    req.originalUrl?.startsWith('/api/admin') ||
+    req.path?.startsWith('/public') ||
+    req.baseUrl?.startsWith('/api/public') ||
+    req.originalUrl?.startsWith('/api/public')
+  ) {
     return next();
   }
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
