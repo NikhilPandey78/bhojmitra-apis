@@ -41,6 +41,7 @@ app.use(
 app.use(express.json({ limit: '1mb' }));
 const tokenFor = (id: string) => jwt.sign({ sub: id }, config.jwtSecret, { expiresIn: '7d' });
 const first = async (sql: string, values: unknown[] = []) => (await db.query(sql, values)).rows[0];
+const formatCurrency = (n: number | string) => Number(n || 0).toFixed(2);
 
 const razorpay = new Razorpay({
   key_id: config.razorpayKeyId,
@@ -130,7 +131,7 @@ async function logAdminActivity(
 
 const logActivity = logAdminActivity;
 
-app.get('/health', async (_req, res) => { try { await db.query('SELECT 1'); res.json({ status: 'ok', database: 'postgresql' }); } catch { res.status(503).json({ status: 'error' }); } });
+app.get(['/health', '/api/health'], async (_req, res) => { try { await db.query('SELECT 1'); res.json({ status: 'ok', database: 'postgresql' }); } catch { res.status(503).json({ status: 'error' }); } });
 app.post('/api/auth/register', async (req, res) => {
   const owner_name = req.body?.owner_name || req.body?.fullName || req.body?.ownerName;
   const restaurant_name = req.body?.restaurant_name || req.body?.restaurantName;
@@ -2522,7 +2523,97 @@ const ALLOWED_RESTO_TABLES = new Set([
   'pos_held_bills',
   'day_closings',
   'purchase_payments',
+  'inventory_locations',
+  'location_inventory',
+  'pos_outlets',
+  'hotel_folio_transactions',
+  'hotel_guests',
+  'hotel_rate_plans',
+  'hotel_folios',
+  'hotel_folio_items',
+  'hotel_room_moves',
+  'kds_stations',
+  'kds_priority_logs',
+  'bar_bottle_sessions',
+  'bar_daily_closings',
+  'hotel_business_dates',
+  'pool_ticket_types',
+  'pool_tickets',
+  'housekeeping_tasks',
+  'engineering_tickets',
+  'hotel_night_audits',
 ]);
+
+const TABLES_WITHOUT_CREATED_AT = new Set([
+  'stock_transfer_items',
+  'stock_adjustment_items',
+  'stock_count_items',
+  'kitchen_requisition_items',
+  'recipe_ingredients',
+  'purchase_order_items',
+  'stock_receipt_items',
+  'purchase_return_items',
+  'stock_issue_items',
+  'sales_order_items',
+  'kot_items',
+  'location_inventory',
+  'bar_bottle_sessions',
+]);
+
+const INDUSTRY_TABLE_RESTRICTIONS: Record<string, string[]> = {
+  // Hospitality & Night Audit resources
+  hotel_rooms: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_bookings: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_guests: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_rate_plans: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_folios: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_folio_items: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_room_moves: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_business_dates: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_banquets: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  hotel_folio_transactions: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  pool_ticket_types: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  pool_tickets: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet'],
+  housekeeping_tasks: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet', 'hospital'],
+  engineering_tickets: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet', 'hospital'],
+  hotel_night_audits: ['hotel', 'resort', 'homestay', 'restaurant', 'cafe', 'club', 'banquet', 'sweet_shop', 'bakery', 'hospital', 'retail', 'grocery', 'f&b'],
+  bar_bottle_sessions: ['hotel', 'resort', 'restaurant', 'cafe', 'club', 'lounge', 'bar'],
+  bar_daily_closings: ['hotel', 'resort', 'restaurant', 'cafe', 'club', 'lounge', 'bar'],
+  kds_stations: ['hotel', 'resort', 'restaurant', 'cafe', 'club', 'lounge', 'sweet_shop', 'bakery'],
+  kds_priority_logs: ['hotel', 'resort', 'restaurant', 'cafe', 'club', 'lounge', 'sweet_shop', 'bakery'],
+
+  // Healthcare / Hospital resources
+  hospital_departments: ['hospital', 'clinic', 'pharmacy', 'restaurant', 'hotel'],
+  hospital_patients: ['hospital', 'clinic', 'pharmacy', 'restaurant', 'hotel'],
+  patient_medicine_issues: ['hospital', 'clinic', 'pharmacy', 'restaurant', 'hotel'],
+  material_requests: ['hospital', 'clinic', 'pharmacy', 'restaurant', 'hotel'],
+
+  // Sweet Shop & Bakery production resources
+  production_batches: ['sweet_shop', 'bakery', 'restaurant', 'cafe', 'hotel', 'retail'],
+  custom_orders: ['sweet_shop', 'bakery', 'restaurant', 'cafe', 'hotel', 'retail'],
+
+  // Food & Beverage / Restaurant / Cafe / Hotel dining resources
+  kot_tickets: ['restaurant', 'hotel', 'cafe', 'sweet_shop', 'bakery', 'resort', 'club'],
+  kot_items: ['restaurant', 'hotel', 'cafe', 'sweet_shop', 'bakery', 'resort', 'club'],
+  dining_tables: ['restaurant', 'hotel', 'cafe', 'sweet_shop', 'bakery', 'resort', 'club'],
+};
+
+async function checkIndustryAccess(partnerId: string, table: string): Promise<{ allowed: boolean; businessType: string }> {
+  const allowedIndustries = INDUSTRY_TABLE_RESTRICTIONS[table];
+  if (!allowedIndustries) return { allowed: true, businessType: 'common' };
+
+  const partner = await first('SELECT business_type FROM partners WHERE id = $1', [partnerId]);
+  let businessType = (partner?.business_type || 'restaurant').toLowerCase().trim();
+  if (businessType === 'supermarket') businessType = 'grocery';
+  if (businessType === 'sweet') businessType = 'sweet_shop';
+  if (businessType === 'retail_shop') businessType = 'retail';
+
+  if (allowedIndustries.includes(businessType)) {
+    return { allowed: true, businessType };
+  }
+  return { allowed: false, businessType };
+}
+
 app.get('/api/resto/dashboard/stats', requireAuth, async (req: AuthenticatedRequest, res) => {
   const partnerId = req.userId;
   if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
@@ -2605,26 +2696,20 @@ app.get('/api/resto/dashboard/stats', requireAuth, async (req: AuthenticatedRequ
   }
 });
 
-const TABLES_WITHOUT_CREATED_AT = new Set([
-  'stock_transfer_items',
-  'stock_adjustment_items',
-  'stock_count_items',
-  'kitchen_requisition_items',
-  'recipe_ingredients',
-  'purchase_order_items',
-  'stock_receipt_items',
-  'purchase_return_items',
-  'stock_issue_items',
-  'sales_order_items',
-  'kot_items',
-]);
-
-app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
+app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res, next) => {
   const table = String(req.params.table || '');
   const partnerId = req.userId;
   if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
   if (!ALLOWED_RESTO_TABLES.has(table)) {
-    return res.status(400).json({ error: `Unknown resource: ${table}` });
+    return next();
+  }
+
+  const { allowed, businessType } = await checkIndustryAccess(partnerId, table);
+  if (!allowed) {
+    return res.status(403).json({
+      error: `Access Denied: The resource '${table}' is not available for business vertical '${businessType}'.`,
+      code: 'INDUSTRY_RESTRICTED',
+    });
   }
 
   try {
@@ -2780,7 +2865,12 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
     limitClause = ` LIMIT ${Math.min(1000, Number(req.query.limit))}`;
   }
 
-  const querySql = `SELECT * FROM ${table} ${whereClause}${orderClause}${limitClause}`;
+  let offsetClause = '';
+  if (req.query.offset && !isNaN(Number(req.query.offset))) {
+    offsetClause = ` OFFSET ${Math.max(0, Number(req.query.offset))}`;
+  }
+
+  const querySql = `SELECT * FROM ${table} ${whereClause}${orderClause}${limitClause}${offsetClause}`;
   const result = await db.query(querySql, values);
   const rows = result.rows;
 
@@ -2812,9 +2902,10 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.item = itemMap[row.item_id] || null;
     }
   } else if (table === 'stock_transfers' && rows.length > 0) {
+    const rowIds = rows.map(r => r.id);
     const [branches, items] = await Promise.all([
       db.query('SELECT * FROM branches WHERE restaurant_id = $1', [partnerId]),
-      db.query('SELECT * FROM stock_transfer_items WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM stock_transfer_items WHERE restaurant_id = $1 AND stock_transfer_id = ANY($2)', [partnerId, rowIds]),
     ]);
     const branchMap = Object.fromEntries(branches.rows.map(b => [b.id, b]));
     const itemsByTransfer: Record<string, any[]> = {};
@@ -2828,9 +2919,10 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.items = itemsByTransfer[row.id] || [];
     }
   } else if (table === 'purchase_orders' && rows.length > 0) {
+    const rowIds = rows.map(r => r.id);
     const [supps, items] = await Promise.all([
       db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]),
-      db.query('SELECT * FROM purchase_order_items WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM purchase_order_items WHERE restaurant_id = $1 AND purchase_order_id = ANY($2)', [partnerId, rowIds]),
     ]);
     const suppMap = Object.fromEntries(supps.rows.map(s => [s.id, s]));
     const itemsByPO: Record<string, any[]> = {};
@@ -2843,9 +2935,10 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.items = itemsByPO[row.id] || [];
     }
   } else if (table === 'stock_receipts' && rows.length > 0) {
+    const rowIds = rows.map(r => r.id);
     const [supps, items] = await Promise.all([
       db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]),
-      db.query('SELECT * FROM stock_receipt_items WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM stock_receipt_items WHERE restaurant_id = $1 AND stock_receipt_id = ANY($2)', [partnerId, rowIds]),
     ]);
     const suppMap = Object.fromEntries(supps.rows.map(s => [s.id, s]));
     const itemsByReceipt: Record<string, any[]> = {};
@@ -2858,9 +2951,10 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.items = itemsByReceipt[row.id] || [];
     }
   } else if (table === 'purchase_returns' && rows.length > 0) {
+    const rowIds = rows.map(r => r.id);
     const [supps, items] = await Promise.all([
       db.query('SELECT * FROM suppliers WHERE restaurant_id = $1', [partnerId]),
-      db.query('SELECT * FROM purchase_return_items WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM purchase_return_items WHERE restaurant_id = $1 AND purchase_return_id = ANY($2)', [partnerId, rowIds]),
     ]);
     const suppMap = Object.fromEntries(supps.rows.map(s => [s.id, s]));
     const itemsByReturn: Record<string, any[]> = {};
@@ -2873,7 +2967,8 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.items = itemsByReturn[row.id] || [];
     }
   } else if (table === 'stock_adjustments' && rows.length > 0) {
-    const items = await db.query('SELECT * FROM stock_adjustment_items WHERE restaurant_id = $1', [partnerId]);
+    const rowIds = rows.map(r => r.id);
+    const items = await db.query('SELECT * FROM stock_adjustment_items WHERE restaurant_id = $1 AND stock_adjustment_id = ANY($2)', [partnerId, rowIds]);
     const itemsByAdj: Record<string, any[]> = {};
     for (const it of items.rows) {
       if (!itemsByAdj[it.stock_adjustment_id]) itemsByAdj[it.stock_adjustment_id] = [];
@@ -2883,9 +2978,10 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.items = itemsByAdj[row.id] || [];
     }
   } else if (table === 'stock_counts' && rows.length > 0) {
+    const rowIds = rows.map(r => r.id);
     const [branches, items] = await Promise.all([
       db.query('SELECT * FROM branches WHERE restaurant_id = $1', [partnerId]),
-      db.query('SELECT * FROM stock_count_items WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM stock_count_items WHERE restaurant_id = $1 AND stock_count_id = ANY($2)', [partnerId, rowIds]),
     ]);
     const branchMap = Object.fromEntries(branches.rows.map(b => [b.id, b]));
     const itemsByCount: Record<string, any[]> = {};
@@ -2898,7 +2994,8 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.items = itemsByCount[row.id] || [];
     }
   } else if (table === 'stock_issues' && rows.length > 0) {
-    const items = await db.query('SELECT * FROM stock_issue_items WHERE restaurant_id = $1', [partnerId]);
+    const rowIds = rows.map(r => r.id);
+    const items = await db.query('SELECT * FROM stock_issue_items WHERE restaurant_id = $1 AND stock_issue_id = ANY($2)', [partnerId, rowIds]);
     const itemsByIssue: Record<string, any[]> = {};
     for (const it of items.rows) {
       if (!itemsByIssue[it.stock_issue_id]) itemsByIssue[it.stock_issue_id] = [];
@@ -2908,7 +3005,8 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.items = itemsByIssue[row.id] || [];
     }
   } else if (table === 'kitchen_requisitions' && rows.length > 0) {
-    const items = await db.query('SELECT * FROM kitchen_requisition_items WHERE restaurant_id = $1', [partnerId]);
+    const rowIds = rows.map(r => r.id);
+    const items = await db.query('SELECT * FROM kitchen_requisition_items WHERE restaurant_id = $1 AND kitchen_requisition_id = ANY($2)', [partnerId, rowIds]);
     const itemsByReq: Record<string, any[]> = {};
     for (const it of items.rows) {
       if (!itemsByReq[it.kitchen_requisition_id]) itemsByReq[it.kitchen_requisition_id] = [];
@@ -2918,7 +3016,8 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.items = itemsByReq[row.id] || [];
     }
   } else if (table === 'recipes' && rows.length > 0) {
-    const ingredients = await db.query('SELECT * FROM recipe_ingredients WHERE restaurant_id = $1', [partnerId]);
+    const rowIds = rows.map(r => r.id);
+    const ingredients = await db.query('SELECT * FROM recipe_ingredients WHERE restaurant_id = $1 AND recipe_id = ANY($2)', [partnerId, rowIds]);
     const ingByRecipe: Record<string, any[]> = {};
     for (const ing of ingredients.rows) {
       if (!ingByRecipe[ing.recipe_id]) ingByRecipe[ing.recipe_id] = [];
@@ -2940,6 +3039,58 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
       row.from_unit = unitMap[row.from_unit_id] || null;
       row.to_unit = unitMap[row.to_unit_id] || null;
     }
+  } else if (table === 'location_inventory' && rows.length > 0) {
+    const [items, locs] = await Promise.all([
+      db.query('SELECT * FROM inventory_items WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM inventory_locations WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const itemMap = Object.fromEntries(items.rows.map(i => [i.id, i]));
+    const locMap = Object.fromEntries(locs.rows.map(l => [l.id, l]));
+    for (const row of rows) {
+      row.item = itemMap[row.item_id] || null;
+      row.location = locMap[row.location_id] || null;
+    }
+  } else if (table === 'pos_outlets' && rows.length > 0) {
+    const locs = await db.query('SELECT * FROM inventory_locations WHERE restaurant_id = $1', [partnerId]);
+    const locMap = Object.fromEntries(locs.rows.map(l => [l.id, l]));
+    for (const row of rows) {
+      row.location = locMap[row.location_id] || null;
+      row.kitchen_location = locMap[row.kitchen_location_id] || null;
+    }
+  } else if (table === 'hotel_folio_transactions' && rows.length > 0) {
+    const [bookings, rooms] = await Promise.all([
+      db.query('SELECT * FROM hotel_bookings WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM hotel_rooms WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const bookingMap = Object.fromEntries(bookings.rows.map(b => [b.id, b]));
+    const roomMap = Object.fromEntries(rooms.rows.map(r => [r.id, r]));
+    for (const row of rows) {
+      row.booking = bookingMap[row.booking_id] || null;
+      row.room = roomMap[row.room_id] || null;
+    }
+  } else if (table === 'pool_tickets' && rows.length > 0) {
+    const types = await db.query('SELECT * FROM pool_ticket_types WHERE restaurant_id = $1', [partnerId]);
+    const typeMap = Object.fromEntries(types.rows.map(t => [t.id, t]));
+    for (const row of rows) {
+      row.ticket_type = typeMap[row.ticket_type_id] || null;
+    }
+  } else if (table === 'housekeeping_tasks' && rows.length > 0) {
+    const rooms = await db.query('SELECT * FROM hotel_rooms WHERE restaurant_id = $1', [partnerId]);
+    const roomMap = Object.fromEntries(rooms.rows.map(r => [r.id, r]));
+    for (const row of rows) {
+      row.room = roomMap[row.room_id] || null;
+    }
+  } else if (table === 'engineering_tickets' && rows.length > 0) {
+    const [rooms, locs] = await Promise.all([
+      db.query('SELECT * FROM hotel_rooms WHERE restaurant_id = $1', [partnerId]),
+      db.query('SELECT * FROM inventory_locations WHERE restaurant_id = $1', [partnerId]),
+    ]);
+    const roomMap = Object.fromEntries(rooms.rows.map(r => [r.id, r]));
+    const locMap = Object.fromEntries(locs.rows.map(l => [l.id, l]));
+    for (const row of rows) {
+      row.room = roomMap[row.room_id] || null;
+      row.location = locMap[row.location_id] || null;
+    }
   }
 
     return res.json({ data: rows });
@@ -2949,12 +3100,20 @@ app.get('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res)
   }
 });
 
-app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res) => {
+app.post('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, res, next) => {
   const table = String(req.params.table || '');
   const partnerId = req.userId;
   if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
   if (!ALLOWED_RESTO_TABLES.has(table)) {
-    return res.status(400).json({ error: `Unknown resource: ${table}` });
+    return next();
+  }
+
+  const { allowed, businessType } = await checkIndustryAccess(partnerId, table);
+  if (!allowed) {
+    return res.status(403).json({
+      error: `Access Denied: The resource '${table}' is not available for business vertical '${businessType}'.`,
+      code: 'INDUSTRY_RESTRICTED',
+    });
   }
 
   try {
@@ -3197,6 +3356,14 @@ app.patch('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, re
     return res.status(400).json({ error: `Unknown resource: ${table}` });
   }
 
+  const { allowed, businessType } = await checkIndustryAccess(partnerId, table);
+  if (!allowed) {
+    return res.status(403).json({
+      error: `Access Denied: The resource '${table}' is not available for business vertical '${businessType}'.`,
+      code: 'INDUSTRY_RESTRICTED',
+    });
+  }
+
   const id = (req.query.id || req.body?.id) as string;
 
   try {
@@ -3323,6 +3490,14 @@ app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, r
     return res.status(400).json({ error: `Unknown resource: ${table}` });
   }
 
+  const { allowed, businessType } = await checkIndustryAccess(partnerId, table);
+  if (!allowed) {
+    return res.status(403).json({
+      error: `Access Denied: The resource '${table}' is not available for business vertical '${businessType}'.`,
+      code: 'INDUSTRY_RESTRICTED',
+    });
+  }
+
   const id = (req.query.id || req.body?.id) as string;
   const vals: any[] = [partnerId];
   let whereClause = `WHERE restaurant_id = $1`;
@@ -3353,6 +3528,113 @@ app.delete('/api/resto/:table', requireAuth, async (req: AuthenticatedRequest, r
 // ============================================================
 // POS CHECKOUT & ORDER DISPATCH API
 // ============================================================
+// ATOMIC MULTI-LOCATION STOCK ADJUSTMENT HELPER
+// ============================================================
+async function adjustLocationStock(
+  client: any,
+  partnerId: string,
+  locationId: string | null,
+  itemId: string,
+  qtyChange: number,
+  refType: string,
+  refId: string,
+  notes: string = '',
+  allowNegative: boolean = false
+) {
+  if (!itemId) return 0;
+  const qty = Number(qtyChange);
+
+  // If a location is specified, manage location_inventory
+  let targetLocationId = locationId;
+  if (!targetLocationId) {
+    // Find default or first active location
+    const defLoc = (
+      await client.query(
+        `SELECT id FROM inventory_locations WHERE restaurant_id = $1 AND (is_default = TRUE OR type = 'warehouse') ORDER BY is_default DESC, created_at ASC LIMIT 1`,
+        [partnerId]
+      )
+    ).rows[0];
+    if (defLoc) targetLocationId = defLoc.id;
+  }
+
+  let locQtyAfter = 0;
+  if (targetLocationId) {
+    const locRow = (
+      await client.query(
+        `SELECT * FROM location_inventory WHERE restaurant_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE`,
+        [partnerId, targetLocationId, itemId]
+      )
+    ).rows[0];
+
+    const currentLocQty = locRow ? Number(locRow.quantity || 0) : 0;
+    locQtyAfter = currentLocQty + qty;
+
+    if (locQtyAfter < 0 && !allowNegative) {
+      const itmInfo = (await client.query('SELECT name FROM inventory_items WHERE id = $1', [itemId])).rows[0];
+      const locInfo = (await client.query('SELECT name FROM inventory_locations WHERE id = $1', [targetLocationId])).rows[0];
+      throw new Error(`Insufficient stock for "${itmInfo?.name || itemId}" at "${locInfo?.name || 'Selected Location'}". Available: ${currentLocQty}, Required: ${Math.abs(qty)}`);
+    }
+
+    if (locRow) {
+      await client.query(
+        `UPDATE location_inventory SET quantity = $1, updated_at = NOW() WHERE id = $2`,
+        [locQtyAfter, locRow.id]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO location_inventory (id, restaurant_id, location_id, item_id, quantity, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [randomUUID(), partnerId, targetLocationId, itemId, locQtyAfter]
+      );
+    }
+  }
+
+  // Also update overall global inventory_items for seamless compatibility
+  const globalRow = (
+    await client.query(
+      `SELECT current_stock, purchase_price FROM inventory_items WHERE id = $1 AND restaurant_id = $2 FOR UPDATE`,
+      [itemId, partnerId]
+    )
+  ).rows[0];
+
+  let globalQtyAfter = 0;
+  let unitCost = 0;
+  if (globalRow) {
+    unitCost = Number(globalRow.purchase_price || 0);
+    const currGlobal = Number(globalRow.current_stock || 0);
+    globalQtyAfter = Math.max(0, currGlobal + qty);
+    await client.query(
+      `UPDATE inventory_items SET current_stock = $1, updated_at = NOW() WHERE id = $2`,
+      [globalQtyAfter, itemId]
+    );
+  }
+
+  // Write immutable stock transaction record
+  await client.query(
+    `INSERT INTO stock_transactions
+     (id, restaurant_id, branch_id, item_id, transaction_type, quantity_change, quantity_after, reference_type, reference_id, unit_cost, notes, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
+    [
+      randomUUID(),
+      partnerId,
+      null,
+      itemId,
+      qty >= 0 ? (refType === 'transfer' ? 'transfer_in' : 'purchase') : (refType === 'consumption' ? 'consumption' : 'sales'),
+      qty,
+      targetLocationId ? locQtyAfter : globalQtyAfter,
+      refType,
+      refId,
+      unitCost,
+      notes,
+    ]
+  );
+
+  return targetLocationId ? locQtyAfter : globalQtyAfter;
+}
+
+// ============================================================
+// POS CHECKOUT WITH RECIPE BOM DEDUCTION & ROOM FOLIO
+// ============================================================
 app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: AuthenticatedRequest, res) => {
   const partnerId = req.userId;
   if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
@@ -3373,6 +3655,12 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
     payment_status = 'paid',
     notes = '',
     branch_id = null,
+    outlet_id = null,
+    outlet_name = null,
+    location_id = null,
+    is_room_charge = false,
+    room_id = null,
+    guest_booking_id = null,
   } = req.body || {};
 
   if (!items || !Array.isArray(items) || items.length === 0) {
@@ -3383,7 +3671,22 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
   try {
     await client.query('BEGIN');
 
-    // 1. Generate Order & KOT Numbers
+    // 1. Determine active inventory location for this checkout
+    let activeLocationId = location_id;
+    let resolvedOutletName = outlet_name;
+    if (outlet_id && (!activeLocationId || !resolvedOutletName)) {
+      const outletRow = (await client.query('SELECT * FROM pos_outlets WHERE id = $1 AND restaurant_id = $2', [outlet_id, partnerId])).rows[0];
+      if (outletRow) {
+        if (!activeLocationId) activeLocationId = outletRow.kitchen_location_id || outletRow.location_id;
+        if (!resolvedOutletName) resolvedOutletName = outletRow.name;
+      }
+    }
+    if (!activeLocationId) {
+      const defaultLoc = (await client.query(`SELECT id FROM inventory_locations WHERE restaurant_id = $1 AND (type = 'kitchen' OR is_default = TRUE) ORDER BY is_default DESC LIMIT 1`, [partnerId])).rows[0];
+      if (defaultLoc) activeLocationId = defaultLoc.id;
+    }
+
+    // 2. Generate Order & KOT Numbers
     const countRes = await client.query('SELECT COUNT(*) FROM sales_orders WHERE restaurant_id = $1', [partnerId]);
     const orderCount = parseInt(countRes.rows[0].count, 10) + 1;
     const orderNumber = `ORD-${String(orderCount).padStart(4, '0')}`;
@@ -3391,7 +3694,7 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
     const orderId = randomUUID();
     const kotId = randomUUID();
 
-    // 2. Fetch table details if table_id is provided
+    // 3. Update Dining Table status if table_id is provided
     let tableNumber = null;
     if (table_id) {
       const tableRow = (await client.query('SELECT * FROM dining_tables WHERE id = $1 AND restaurant_id = $2', [table_id, partnerId])).rows[0];
@@ -3399,17 +3702,128 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
         tableNumber = tableRow.table_number || tableRow.name;
         await client.query(
           `UPDATE dining_tables SET status = $1, current_order_id = $2, updated_at = NOW() WHERE id = $3`,
-          [payment_status === 'paid' ? 'available' : 'occupied', payment_status === 'paid' ? null : orderId, table_id]
+          [payment_status === 'paid' || payment_mode === 'charge_to_room' ? 'available' : 'occupied', payment_status === 'paid' ? null : orderId, table_id]
         );
       }
     }
 
-    // 3. Insert sales_orders
+    // 4. Handle Room Folio Charge if selected
+    let folioTxnId: string | null = null;
+    let actualPaymentStatus = payment_status;
+    let resolvedBookingId = guest_booking_id;
+    let resolvedRoomId = room_id;
+
+    if (payment_mode === 'charge_to_room' || payment_mode === 'room_folio' || is_room_charge) {
+      actualPaymentStatus = 'charged_to_room';
+      let bookingRow: any = null;
+
+      if (resolvedBookingId) {
+        bookingRow = (await client.query('SELECT * FROM hotel_bookings WHERE id = $1 AND restaurant_id = $2', [resolvedBookingId, partnerId])).rows[0];
+      } else if (resolvedRoomId) {
+        bookingRow = (await client.query(
+          `SELECT * FROM hotel_bookings WHERE restaurant_id = $1 AND room_id = $2 AND status IN ('reserved', 'checked_in', 'admitted') ORDER BY created_at DESC LIMIT 1`,
+          [partnerId, resolvedRoomId]
+        )).rows[0];
+      }
+
+      if (!bookingRow) {
+        throw new Error('No active checked-in guest booking found for this room to charge folio.');
+      }
+
+      resolvedBookingId = bookingRow.id;
+      resolvedRoomId = bookingRow.room_id;
+      folioTxnId = randomUUID();
+
+      const folioChargeDesc = `${resolvedOutletName || 'POS Outlet'} Order #${orderNumber} (${order_type.replace('_', ' ')})`;
+
+      // Insert into hotel_folio_transactions
+      await client.query(
+        `INSERT INTO hotel_folio_transactions
+         (id, restaurant_id, booking_id, room_id, outlet_id, outlet_name, order_id, order_number, charge_type, description, amount, payment_status, created_by, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'unpaid', $12, NOW())`,
+        [
+          folioTxnId,
+          partnerId,
+          resolvedBookingId,
+          resolvedRoomId,
+          outlet_id,
+          resolvedOutletName || 'POS Outlet',
+          orderId,
+          orderNumber,
+          order_type === 'room_service' ? 'room_service' : 'restaurant',
+          folioChargeDesc,
+          Number(total_amount),
+          partnerId,
+        ]
+      );
+
+      // Update hotel_bookings charges and balance due
+      const existingFolio = Array.isArray(bookingRow.folio_charges) ? bookingRow.folio_charges : [];
+      existingFolio.push({
+        id: folioTxnId,
+        order_id: orderId,
+        order_number: orderNumber,
+        outlet: resolvedOutletName || 'POS Outlet',
+        description: folioChargeDesc,
+        amount: Number(total_amount),
+        date: new Date().toISOString(),
+      });
+
+      const updatedServiceCharge = Number(bookingRow.room_service_charge || 0) + Number(total_amount);
+      const updatedTotalAmount = Number(bookingRow.total_amount || 0) + Number(total_amount);
+      const updatedBalanceDue = Number(bookingRow.balance_due || 0) + Number(total_amount);
+
+      await client.query(
+        `UPDATE hotel_bookings
+         SET room_service_charge = $1, total_amount = $2, balance_due = $3, folio_charges = $4, updated_at = NOW()
+         WHERE id = $5`,
+        [updatedServiceCharge, updatedTotalAmount, updatedBalanceDue, JSON.stringify(existingFolio), resolvedBookingId]
+      );
+
+      // Auto-post to multi-window folio (Window 2: Food & Beverage)
+      let masterFolio = (await client.query('SELECT * FROM hotel_folios WHERE booking_id = $1 AND restaurant_id = $2', [resolvedBookingId, partnerId])).rows[0];
+      if (!masterFolio) {
+        const fId = randomUUID();
+        const fNum = `FOL-${Date.now().toString().slice(-6)}`;
+        masterFolio = (await client.query(
+          `INSERT INTO hotel_folios (id, restaurant_id, booking_id, folio_number, guest_id, room_id, status, total_charges, balance_due, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8, NOW(), NOW()) RETURNING *`,
+          [fId, partnerId, resolvedBookingId, fNum, bookingRow.guest_id || null, resolvedRoomId || null, updatedTotalAmount, updatedBalanceDue]
+        )).rows[0];
+      } else {
+        await client.query(
+          `UPDATE hotel_folios SET total_charges = total_charges + $1, balance_due = balance_due + $1, updated_at = NOW() WHERE id = $2`,
+          [Number(total_amount), masterFolio.id]
+        );
+      }
+
+      await client.query(
+        `INSERT INTO hotel_folio_items 
+         (id, folio_id, booking_id, restaurant_id, window_number, transaction_type, charge_category, source_outlet_id, source_reference_id, description, amount, tax_amount, net_amount, currency, status, posted_by, created_at)
+         VALUES ($1, $2, $3, $4, 2, 'DEBIT', 'FOOD_BEVERAGE', $5, $6, $7, $8, $9, $10, $11, 'POSTED', $12, NOW())`,
+        [
+          randomUUID(),
+          masterFolio.id,
+          resolvedBookingId,
+          partnerId,
+          outlet_id || null,
+          orderId,
+          folioChargeDesc,
+          Number(subtotal),
+          Number(tax_amount),
+          Number(total_amount),
+          'INR',
+          partnerId
+        ]
+      );
+    }
+
+    // 5. Insert sales_orders
     const orderRow = (
       await client.query(
         `INSERT INTO sales_orders
-         (id, restaurant_id, branch_id, table_id, order_number, order_type, customer_name, customer_phone, subtotal, discount_amount, discount_percent, tax_amount, tax_percent, total_amount, payment_status, payment_mode, status, notes, created_by, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'completed', $17, $18, NOW(), NOW())
+         (id, restaurant_id, branch_id, table_id, order_number, order_type, customer_name, customer_phone, subtotal, discount_amount, discount_percent, tax_amount, tax_percent, total_amount, payment_status, payment_mode, status, notes, outlet_id, outlet_name, location_id, is_room_charge, room_id, guest_booking_id, folio_transaction_id, created_by, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'completed', $17, $18, $19, $20, $21, $22, $23, $24, $25, NOW(), NOW())
          RETURNING *`,
         [
           orderId,
@@ -3426,15 +3840,22 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
           Number(tax_amount),
           Number(tax_percent),
           Number(total_amount),
-          payment_status,
+          actualPaymentStatus,
           payment_mode,
           notes,
+          outlet_id,
+          resolvedOutletName || 'Restaurant POS',
+          activeLocationId,
+          payment_mode === 'charge_to_room' || is_room_charge,
+          resolvedRoomId,
+          resolvedBookingId,
+          folioTxnId,
           partnerId,
         ]
       )
     ).rows[0];
 
-    // 4. Insert sales_order_items & deduction from inventory if linked
+    // 6. Insert sales_order_items & execute AUTOMATIC RECIPE BOM or DIRECT INVENTORY DEDUCTION
     for (const itm of items) {
       const itmId = randomUUID();
       const qty = Number(itm.quantity || 1);
@@ -3460,24 +3881,53 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
         ]
       );
 
-      // If direct inventory item is linked, deduct stock and record stock_transaction
-      if (itm.item_id) {
-        const invRow = (await client.query('SELECT current_stock FROM inventory_items WHERE id = $1 AND restaurant_id = $2', [itm.item_id, partnerId])).rows[0];
-        if (invRow) {
-          const current = Number(invRow.current_stock || 0);
-          const newQty = Math.max(0, current - qty);
-          await client.query('UPDATE inventory_items SET current_stock = $1, updated_at = NOW() WHERE id = $2', [newQty, itm.item_id]);
-          await client.query(
-            `INSERT INTO stock_transactions
-             (id, restaurant_id, branch_id, item_id, transaction_type, quantity_change, quantity_after, reference_type, reference_id, unit_cost, notes)
-             VALUES ($1, $2, $3, $4, 'sales', $5, $6, 'sales_order', $7, $8, $9)`,
-            [randomUUID(), partnerId, branch_id, itm.item_id, -qty, newQty, orderId, rate, `POS Sale ${orderNumber}`]
-          );
+      // A. If linked to a Menu Item, check for Recipe Ingredients and auto-deduct Bill of Materials
+      if (itm.menu_item_id) {
+        const menuItemRow = (await client.query('SELECT * FROM menu_items WHERE id = $1 AND restaurant_id = $2', [itm.menu_item_id, partnerId])).rows[0];
+        if (menuItemRow && menuItemRow.recipe_id) {
+          const ingredients = (await client.query('SELECT * FROM recipe_ingredients WHERE recipe_id = $1 AND restaurant_id = $2', [menuItemRow.recipe_id, partnerId])).rows;
+          for (const ing of ingredients) {
+            const ingQtyNeeded = Number(ing.quantity || 0) * qty;
+            if (ing.item_id && ingQtyNeeded > 0) {
+              await adjustLocationStock(
+                client,
+                partnerId,
+                activeLocationId,
+                ing.item_id,
+                -ingQtyNeeded,
+                'consumption',
+                orderId,
+                `POS Recipe Consumption: ${qty}x ${itm.name || itm.item_name || 'Dish'}`
+              );
+            }
+          }
         }
+      }
+
+      // B. If linked directly to an Inventory Item (Non-recipe retail / beverage / liquor)
+      if (itm.item_id) {
+        let deductQty = qty;
+        // Liquor unit conversions (e.g., selling 60 ML from a 750 ML bottle, or serving_size_ml)
+        if (itm.serving_size_ml && itm.bottle_size_ml) {
+          deductQty = (Number(itm.serving_size_ml) / Number(itm.bottle_size_ml)) * qty;
+        } else if (itm.peg_ml && itm.bottle_ml) {
+          deductQty = (Number(itm.peg_ml) / Number(itm.bottle_ml)) * qty;
+        }
+
+        await adjustLocationStock(
+          client,
+          partnerId,
+          activeLocationId,
+          itm.item_id,
+          -deductQty,
+          'sales',
+          orderId,
+          `POS Direct Sale: ${itm.name || itm.item_name || 'Item'} (${deductQty} units)`
+        );
       }
     }
 
-    // 5. Create KOT Ticket for kitchen display
+    // 7. Create KOT Ticket for kitchen display
     const kotTicket = (
       await client.query(
         `INSERT INTO kot_tickets
@@ -3493,7 +3943,7 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
           orderId,
           kotNumber,
           order_type,
-          'POS Counter',
+          resolvedOutletName || 'POS Counter',
           notes,
         ]
       )
@@ -3501,22 +3951,25 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
 
     // Insert KOT Items
     for (const itm of items) {
+      const itmName = itm.item_name || itm.name || 'Item';
+      const itmStation = itm.station_code || getItemStation(itmName);
       await client.query(
-        `INSERT INTO kot_items (id, kot_id, restaurant_id, item_name, quantity, unit, notes, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
+        `INSERT INTO kot_items (id, kot_id, restaurant_id, item_name, quantity, unit, notes, status, station_code)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)`,
         [
           randomUUID(),
           kotId,
           partnerId,
-          itm.item_name || itm.name || 'Item',
+          itmName,
           Number(itm.quantity || 1),
           itm.unit || 'portion',
           itm.notes || null,
+          itmStation,
         ]
       );
     }
 
-    // 6. Update Customer Spend if customer_name or phone is provided
+    // 8. Update Customer Spend if customer_name or phone is provided
     if (customer_phone || customer_name) {
       const existingCust = (
         await client.query(
@@ -3538,7 +3991,7 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
       }
     }
 
-    // 7. If payment_mode is 'khata', record transaction in customer_khata ledger
+    // 9. If payment_mode is 'khata', record transaction in customer_khata ledger
     if (payment_mode === 'khata' && (customer_name || customer_phone)) {
       const khataRow = (
         await client.query(
@@ -3575,7 +4028,7 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
       }
     }
 
-    // 8. Activity log for Super Admin
+    // 10. Immutable Activity Log
     await client.query(
       `INSERT INTO activity_logs (id, restaurant_id, user_id, user_name, action, entity_type, entity_id, description, ip_address, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
@@ -3587,7 +4040,7 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
         'Order Placed',
         'sales_order',
         orderId,
-        `POS Order #${orderNumber} placed for ₹${Number(total_amount).toLocaleString('en-IN')} (${payment_mode})`,
+        `POS Order #${orderNumber} placed for ${Number(total_amount)} (${payment_mode}${folioTxnId ? ' - Charged to Room' : ''})`,
         req.ip || '127.0.0.1',
       ]
     );
@@ -3601,6 +4054,7 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
         kot: kotTicket,
         order_number: orderNumber,
         kot_number: kotNumber,
+        folio_transaction_id: folioTxnId,
       },
     });
   } catch (err: any) {
@@ -3609,6 +4063,1449 @@ app.post('/api/resto/sales-pos/checkout', requireAuth, async (req: Authenticated
     return res.status(500).json({ error: err?.message || 'Failed to process POS checkout' });
   } finally {
     client.release();
+  }
+});
+
+// ============================================================
+// ATOMIC STOCK TRANSFER COMPLETION ENDPOINT
+// ============================================================
+app.post('/api/resto/stock-transfers/complete', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { transfer_id, from_location_id, to_location_id, items = [] } = req.body || {};
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    let transferRecord: any = null;
+    let actualFromLoc = from_location_id;
+    let actualToLoc = to_location_id;
+    let transferItems = items;
+
+    if (transfer_id) {
+      transferRecord = (await client.query('SELECT * FROM stock_transfers WHERE id = $1 AND restaurant_id = $2 FOR UPDATE', [transfer_id, partnerId])).rows[0];
+      if (!transferRecord) throw new Error('Stock transfer record not found.');
+      actualFromLoc = transferRecord.from_location_id || from_location_id;
+      actualToLoc = transferRecord.to_location_id || to_location_id;
+      if (transferItems.length === 0) {
+        transferItems = (await client.query('SELECT * FROM stock_transfer_items WHERE stock_transfer_id = $1 AND restaurant_id = $2', [transfer_id, partnerId])).rows;
+      }
+    }
+
+    if (!actualFromLoc || !actualToLoc) {
+      throw new Error('Both from_location_id and to_location_id are required for stock transfer.');
+    }
+    if (actualFromLoc === actualToLoc) {
+      throw new Error('Source location and destination location must be different.');
+    }
+    if (!transferItems || transferItems.length === 0) {
+      throw new Error('Transfer must include at least one item.');
+    }
+
+    for (const itm of transferItems) {
+      const itmId = itm.item_id;
+      const itmQty = Number(itm.quantity || 0);
+      if (!itmId || itmQty <= 0) continue;
+
+      // Deduct from Source Location
+      await adjustLocationStock(
+        client,
+        partnerId,
+        actualFromLoc,
+        itmId,
+        -itmQty,
+        'transfer',
+        transfer_id || 'manual_transfer',
+        `Transfer Out to Location ${actualToLoc}`
+      );
+
+      // Add to Destination Location
+      await adjustLocationStock(
+        client,
+        partnerId,
+        actualToLoc,
+        itmId,
+        itmQty,
+        'transfer',
+        transfer_id || 'manual_transfer',
+        `Transfer In from Location ${actualFromLoc}`
+      );
+    }
+
+    if (transfer_id) {
+      await client.query(
+        `UPDATE stock_transfers SET status = 'completed', completed_by = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2`,
+        [partnerId, transfer_id]
+      );
+    }
+
+    await client.query('COMMIT');
+    return res.json({ success: true, message: 'Stock transfer completed successfully.' });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Stock transfer completion error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to complete stock transfer' });
+  } finally {
+    client.release();
+  }
+});
+
+// ============================================================
+// TENANT CONFIGURATION & INTERNATIONALIZATION ENDPOINT
+// ============================================================
+app.get('/api/resto/tenant-config', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const partner = (await db.query('SELECT id, restaurant_name, business_type, currency, currency_symbol, tax_name, default_tax_rate, locale FROM partners WHERE id = $1', [partnerId])).rows[0];
+    if (!partner) return res.status(404).json({ error: 'Tenant not found' });
+
+    return res.json({
+      data: {
+        currency: partner.currency || 'INR',
+        currency_symbol: partner.currency_symbol || '₹',
+        tax_name: partner.tax_name || 'GST',
+        default_tax_rate: Number(partner.default_tax_rate || 5),
+        locale: partner.locale || 'en-IN',
+        restaurant_name: partner.restaurant_name,
+        business_type: partner.business_type || 'restaurant',
+      },
+    });
+  } catch (err: any) {
+    console.error('Get tenant-config error:', err);
+    return res.status(500).json({ error: 'Failed to fetch tenant configuration' });
+  }
+});
+
+app.patch('/api/resto/tenant-config', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { currency, currency_symbol, tax_name, default_tax_rate, locale } = req.body || {};
+
+  try {
+    const updated = (
+      await db.query(
+        `UPDATE partners
+         SET currency = COALESCE($1, currency),
+             currency_symbol = COALESCE($2, currency_symbol),
+             tax_name = COALESCE($3, tax_name),
+             default_tax_rate = COALESCE($4, default_tax_rate),
+             locale = COALESCE($5, locale),
+             updated_at = NOW()
+         WHERE id = $6
+         RETURNING id, currency, currency_symbol, tax_name, default_tax_rate, locale`,
+        [currency, currency_symbol, tax_name, default_tax_rate !== undefined ? Number(default_tax_rate) : null, locale, partnerId]
+      )
+    ).rows[0];
+
+    return res.json({ success: true, data: updated });
+  } catch (err: any) {
+    console.error('Patch tenant-config error:', err);
+    return res.status(500).json({ error: 'Failed to update tenant configuration' });
+  }
+});
+
+// ============================================================
+// ENTERPRISE HOTEL PMS, CHECK-IN & ROOM MOVE APIS
+// ============================================================
+
+// POST /api/resto/hotel/check-in (Strict Check-In Validation Engine)
+app.post('/api/resto/hotel/check-in', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { booking_id, room_id, id_proof_type, id_proof_number, deposit_amount = 0, notes = '' } = req.body || {};
+  if (!booking_id) return res.status(400).json({ error: 'booking_id is required for check-in' });
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Fetch Booking and validate status
+    const booking = (await client.query(
+      'SELECT * FROM hotel_bookings WHERE id = $1 AND restaurant_id = $2 FOR UPDATE',
+      [booking_id, partnerId]
+    )).rows[0];
+
+    if (!booking) throw new Error('Reservation not found.');
+    if (booking.status === 'checked_in' || booking.status === 'checked_out') {
+      throw new Error(`Cannot check in. Reservation is already ${booking.status.replace('_', ' ')}.`);
+    }
+
+    // 2. Validate Assigned Room
+    const targetRoomId = room_id || booking.room_id;
+    if (!targetRoomId) {
+      throw new Error('A room must be assigned to complete check-in.');
+    }
+
+    const room = (await client.query(
+      'SELECT * FROM hotel_rooms WHERE id = $1 AND restaurant_id = $2 FOR UPDATE',
+      [targetRoomId, partnerId]
+    )).rows[0];
+
+    if (!room) throw new Error('Assigned room does not exist.');
+
+    // 3. Strict Room Cleanliness Validation
+    const cleanStatus = (room.cleaning_status || '').toLowerCase();
+    const roomState = (room.status || '').toLowerCase();
+    const roomStatusGranular = (room.room_status || '').toUpperCase();
+
+    if (roomState === 'occupied' || cleanStatus === 'dirty' || cleanStatus === 'cleaning' || roomState === 'maintenance' || room.is_out_of_order) {
+      throw new Error(`Cannot check in to Room ${room.room_number}. Room is currently ${cleanStatus || roomState} and not ready for guest arrival.`);
+    }
+
+    // 4. Update or Create Guest Profile KYC
+    let guestId = booking.guest_id;
+    if (!guestId && booking.guest_phone) {
+      const existingGuest = (await client.query(
+        'SELECT id FROM hotel_guests WHERE restaurant_id = $1 AND phone = $2 LIMIT 1',
+        [partnerId, booking.guest_phone]
+      )).rows[0];
+
+      if (existingGuest) {
+        guestId = existingGuest.id;
+        await client.query(
+          `UPDATE hotel_guests SET total_stays = total_stays + 1, updated_at = NOW() WHERE id = $1`,
+          [guestId]
+        );
+      } else {
+        guestId = randomUUID();
+        await client.query(
+          `INSERT INTO hotel_guests (id, restaurant_id, full_name, phone, email, id_proof_type, id_proof_number, total_stays, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 1, NOW(), NOW())`,
+          [
+            guestId,
+            partnerId,
+            booking.guest_name,
+            booking.guest_phone,
+            booking.guest_email || null,
+            id_proof_type || booking.id_proof_type || 'Aadhaar Card',
+            id_proof_number || booking.id_proof_number || null,
+          ]
+        );
+      }
+    }
+
+    // 5. Initialize Master Multi-Window Folio for this Stay
+    let masterFolioId = booking.master_folio_id;
+    if (!masterFolioId) {
+      const existingFolio = (await client.query(
+        'SELECT id FROM hotel_folios WHERE restaurant_id = $1 AND booking_id = $2 LIMIT 1',
+        [partnerId, booking_id]
+      )).rows[0];
+
+      if (existingFolio) {
+        masterFolioId = existingFolio.id;
+      } else {
+        masterFolioId = randomUUID();
+        const folioNumber = `FOL-${Date.now().toString().slice(-6)}`;
+        await client.query(
+          `INSERT INTO hotel_folios (id, restaurant_id, booking_id, folio_number, guest_id, room_id, status, total_charges, balance_due, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8, NOW(), NOW())`,
+          [
+            masterFolioId,
+            partnerId,
+            booking_id,
+            folioNumber,
+            guestId || null,
+            targetRoomId,
+            Number(booking.room_charge || 0),
+            Math.max(0, Number(booking.room_charge || 0) - Number(booking.paid_amount || 0)),
+          ]
+        );
+
+        // Auto-post initial Room Charge to Folio Window 1
+        if (Number(booking.room_charge || 0) > 0) {
+          const roomChargeId = randomUUID();
+          await client.query(
+            `INSERT INTO hotel_folio_items (id, folio_id, restaurant_id, booking_id, window_number, charge_category, source_module, description, amount, tax_amount, total_amount, payment_status, created_at)
+             VALUES ($1, $2, $3, $4, 1, 'room_charge', 'front_desk', $5, $6, $7, $8, 'unpaid', NOW())`,
+            [
+              roomChargeId,
+              masterFolioId,
+              partnerId,
+              booking_id,
+              `Room Charge: Room ${room.room_number} (${booking.room_type || room.room_type || 'Standard'})`,
+              Number(booking.room_charge || 0),
+              Number(booking.tax_amount || 0),
+              Number(booking.room_charge || 0) + Number(booking.tax_amount || 0),
+            ]
+          );
+        }
+      }
+    }
+
+    // 6. Update Room State to OCCUPIED_CLEAN
+    await client.query(
+      `UPDATE hotel_rooms SET status = 'occupied', room_status = 'OCCUPIED_CLEAN', cleaning_status = 'occupied', updated_at = NOW() WHERE id = $1`,
+      [targetRoomId]
+    );
+
+    // 7. Update Booking to IN_HOUSE / checked_in
+    const updatedBooking = (await client.query(
+      `UPDATE hotel_bookings
+       SET status = 'checked_in',
+           reservation_status = 'IN_HOUSE',
+           room_id = $1,
+           room_number = $2,
+           room_type = $3,
+           guest_id = $4,
+           master_folio_id = $5,
+           actual_check_in = NOW(),
+           deposit_amount = deposit_amount + $6,
+           paid_amount = paid_amount + $6,
+           balance_due = GREATEST(0, total_amount - (paid_amount + $6)),
+           id_proof_type = COALESCE($7, id_proof_type),
+           id_proof_number = COALESCE($8, id_proof_number),
+           updated_at = NOW()
+       WHERE id = $9
+       RETURNING *`,
+      [
+        targetRoomId,
+        room.room_number,
+        room.room_type,
+        guestId || null,
+        masterFolioId,
+        Number(deposit_amount),
+        id_proof_type || null,
+        id_proof_number || null,
+        booking_id,
+      ]
+    )).rows[0];
+
+    // 8. Record Activity Log
+    await logAdminActivity(
+      partnerId,
+      partnerId,
+      booking.guest_name,
+      'Guest Check-In',
+      'hotel_booking',
+      booking_id,
+      `Guest ${booking.guest_name} checked in to Room ${room.room_number} (Folio #${masterFolioId.slice(0, 8)})`,
+      req.ip
+    );
+
+    await client.query('COMMIT');
+    return res.json({
+      success: true,
+      message: `Guest ${booking.guest_name} checked in successfully to Room ${room.room_number}.`,
+      data: {
+        booking: updatedBooking,
+        room,
+        master_folio_id: masterFolioId,
+      },
+    });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Check-In error:', err);
+    return res.status(500).json({ error: err?.message || 'Check-in failed' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/resto/hotel/room-move (Atomic Room Transfer with Audit Trail)
+app.post('/api/resto/hotel/room-move', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { booking_id, to_room_id, new_room_id, reason, rate_difference = 0 } = req.body || {};
+  const resolvedToRoomId = to_room_id || new_room_id;
+  if (!booking_id || !resolvedToRoomId || !reason) {
+    return res.status(400).json({ error: 'booking_id, to_room_id, and reason are required for room move.' });
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    const booking = (await client.query(
+      'SELECT * FROM hotel_bookings WHERE id = $1 AND restaurant_id = $2 FOR UPDATE',
+      [booking_id, partnerId]
+    )).rows[0];
+
+    if (!booking) throw new Error('Guest booking not found.');
+    if (booking.status !== 'checked_in') {
+      throw new Error('Only active checked-in in-house guests can be moved.');
+    }
+
+    const fromRoomId = booking.room_id;
+    const fromRoom = (await client.query('SELECT * FROM hotel_rooms WHERE id = $1 AND restaurant_id = $2', [fromRoomId, partnerId])).rows[0];
+    const toRoom = (await client.query('SELECT * FROM hotel_rooms WHERE id = $1 AND restaurant_id = $2 FOR UPDATE', [resolvedToRoomId, partnerId])).rows[0];
+
+    if (!toRoom) throw new Error('Destination room not found.');
+    if (toRoom.status === 'occupied' || (toRoom.cleaning_status && toRoom.cleaning_status === 'dirty')) {
+      throw new Error(`Destination Room ${toRoom.room_number} is not ready/available for room move.`);
+    }
+
+    // 1. Record Room Move transaction
+    const moveId = randomUUID();
+    await client.query(
+      `INSERT INTO hotel_room_moves (id, restaurant_id, booking_id, from_room_id, to_room_id, from_room_number, to_room_number, reason, rate_difference, moved_by, moved_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())`,
+      [
+        moveId,
+        partnerId,
+        booking_id,
+        fromRoomId,
+        resolvedToRoomId,
+        fromRoom?.room_number || booking.room_number || 'Room',
+        toRoom.room_number,
+        reason,
+        Number(rate_difference),
+        partnerId,
+      ]
+    );
+
+    // 2. Set Old Room to VACANT_DIRTY for Housekeeping
+    if (fromRoomId) {
+      await client.query(
+        `UPDATE hotel_rooms SET status = 'cleaning', room_status = 'VACANT_DIRTY', cleaning_status = 'dirty', updated_at = NOW() WHERE id = $1`,
+        [fromRoomId]
+      );
+      await client.query(
+        `INSERT INTO housekeeping_tasks (id, restaurant_id, room_id, room_number, task_type, priority, status, notes, created_at)
+         VALUES ($1, $2, $3, $4, 'room_move_cleaning', 'high', 'pending', $5, NOW())`,
+        [randomUUID(), partnerId, fromRoomId, fromRoom?.room_number || 'Room', `Cleaning required after room move to Room ${toRoom.room_number}`]
+      );
+    }
+
+    // 3. Set New Room to OCCUPIED_CLEAN
+    await client.query(
+      `UPDATE hotel_rooms SET status = 'occupied', room_status = 'OCCUPIED_CLEAN', cleaning_status = 'occupied', updated_at = NOW() WHERE id = $1`,
+      [to_room_id]
+    );
+
+    // 4. Update Booking
+    const updatedTotal = Number(booking.total_amount || 0) + Number(rate_difference);
+    const updatedBalance = Math.max(0, Number(booking.balance_due || 0) + Number(rate_difference));
+    await client.query(
+      `UPDATE hotel_bookings
+       SET room_id = $1, room_number = $2, room_type = $3, total_amount = $4, balance_due = $5, updated_at = NOW()
+       WHERE id = $6`,
+      [to_room_id, toRoom.room_number, toRoom.room_type, updatedTotal, updatedBalance, booking_id]
+    );
+
+    // 5. If rate difference, post line item to Folio Window 1
+    if (Number(rate_difference) !== 0 && booking.master_folio_id) {
+      await client.query(
+        `INSERT INTO hotel_folio_items (id, folio_id, restaurant_id, booking_id, window_number, charge_category, source_module, description, amount, total_amount, payment_status, created_at)
+         VALUES ($1, $2, $3, $4, 1, 'room_charge', 'front_desk', $5, $6, $6, 'unpaid', NOW())`,
+        [
+          randomUUID(),
+          booking.master_folio_id,
+          partnerId,
+          booking_id,
+          `Room Move Upgrade/Adjustment (Room ${fromRoom?.room_number} → ${toRoom.room_number})`,
+          Number(rate_difference),
+        ]
+      );
+    }
+
+    await logAdminActivity(
+      partnerId,
+      partnerId,
+      booking.guest_name,
+      'Room Move',
+      'hotel_room_move',
+      moveId,
+      `Guest ${booking.guest_name} moved from Room ${fromRoom?.room_number} to Room ${toRoom.room_number} (Reason: ${reason})`,
+      req.ip
+    );
+
+    await client.query('COMMIT');
+    return res.json({
+      success: true,
+      message: `Guest successfully moved to Room ${toRoom.room_number}. Old room marked for cleaning.`,
+      to_room: toRoom,
+    });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Room Move error:', err);
+    return res.status(500).json({ error: err?.message || 'Room move failed' });
+  } finally {
+    client.release();
+  }
+});
+
+// ============================================================
+// ENTERPRISE MULTI-WINDOW FOLIO & SETTLEMENT APIS
+// ============================================================
+
+// GET /api/resto/hotel/folios/:bookingId
+app.get('/api/resto/hotel/folios/:bookingId', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+  const { bookingId } = req.params;
+
+  try {
+    const booking = (await first('SELECT * FROM hotel_bookings WHERE id = $1 AND restaurant_id = $2', [bookingId, partnerId]));
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+
+    let folio = (await first('SELECT * FROM hotel_folios WHERE booking_id = $1 AND restaurant_id = $2', [bookingId, partnerId]));
+    if (!folio) {
+      // Auto-provision folio if missing
+      const fId = randomUUID();
+      const fNum = `FOL-${Date.now().toString().slice(-6)}`;
+      folio = (await first(
+        `INSERT INTO hotel_folios (id, restaurant_id, booking_id, folio_number, guest_id, room_id, status, total_charges, balance_due, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8, NOW(), NOW()) RETURNING *`,
+        [fId, partnerId, bookingId, fNum, booking.guest_id || null, booking.room_id || null, Number(booking.room_charge || 0), Number(booking.balance_due || 0)]
+      ));
+    }
+
+    const items = (await db.query(
+      `SELECT * FROM hotel_folio_items WHERE booking_id = $1 AND restaurant_id = $2 ORDER BY created_at ASC`,
+      [bookingId, partnerId]
+    )).rows;
+
+    // Group items into Windows 1 to 4
+    const windows: Record<number, any[]> = { 1: [], 2: [], 3: [], 4: [] };
+    items.forEach((itm: any) => {
+      const w = itm.window_number || 1;
+      if (!windows[w]) windows[w] = [];
+      windows[w].push(itm);
+    });
+
+    const windowTotals = Object.entries(windows).map(([wNum, wItems]) => {
+      const charges = wItems.filter(i => i.charge_category !== 'payment' && i.charge_category !== 'refund').reduce((s, i) => s + Number(i.total_amount || 0), 0);
+      const payments = wItems.filter(i => i.charge_category === 'payment').reduce((s, i) => s + Number(i.amount || 0), 0);
+      const refunds = wItems.filter(i => i.charge_category === 'refund').reduce((s, i) => s + Number(i.amount || 0), 0);
+      return {
+        window_number: Number(wNum),
+        items: wItems,
+        total_charges: charges,
+        total_payments: payments,
+        total_refunds: refunds,
+        balance_due: Math.max(0, charges - payments + refunds),
+      };
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        folio,
+        booking,
+        windows: windowTotals,
+        total_charges: items.filter(i => i.charge_category !== 'payment').reduce((s, i) => s + Number(i.total_amount || 0), 0),
+        total_paid: items.filter(i => i.charge_category === 'payment').reduce((s, i) => s + Number(i.amount || 0), 0),
+      },
+    });
+  } catch (err: any) {
+    console.error('Fetch Folio error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to fetch folio' });
+  }
+});
+
+// POST /api/resto/hotel/folios/charge (Post Charge Item to Specific Folio Window)
+app.post('/api/resto/hotel/folios/charge', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const {
+    booking_id,
+    window_number = 1,
+    charge_category = 'other_charge',
+    source_module = 'front_desk',
+    outlet_id = null,
+    outlet_name = null,
+    description,
+    amount = 0,
+    tax_amount = 0,
+    discount_amount = 0,
+    reference_id = null,
+  } = req.body || {};
+
+  if (!booking_id || !description || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'booking_id, description, and positive amount are required.' });
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    const booking = (await client.query('SELECT * FROM hotel_bookings WHERE id = $1 AND restaurant_id = $2 FOR UPDATE', [booking_id, partnerId])).rows[0];
+    if (!booking) throw new Error('Booking not found.');
+
+    let folio = (await client.query('SELECT id FROM hotel_folios WHERE booking_id = $1 AND restaurant_id = $2', [booking_id, partnerId])).rows[0];
+    const folioId = folio ? folio.id : randomUUID();
+
+    if (!folio) {
+      const folioNumber = `FOL-${Date.now().toString().slice(-6)}`;
+      await client.query(
+        `INSERT INTO hotel_folios (id, restaurant_id, booking_id, folio_number, guest_id, room_id, status, total_charges, balance_due, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'open', 0, 0, NOW(), NOW())`,
+        [folioId, partnerId, booking_id, folioNumber, booking.guest_id || null, booking.room_id || null]
+      );
+    }
+
+    const netAmount = Number(amount) + Number(tax_amount) - Number(discount_amount);
+    const itemId = randomUUID();
+
+    await client.query(
+      `INSERT INTO hotel_folio_items
+       (id, folio_id, restaurant_id, booking_id, window_number, charge_category, source_module, outlet_id, outlet_name, reference_id, description, amount, tax_amount, discount_amount, total_amount, payment_status, posted_by, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'unpaid', $16, NOW())`,
+      [
+        itemId,
+        folioId,
+        partnerId,
+        booking_id,
+        Number(window_number) || 1,
+        charge_category,
+        source_module,
+        outlet_id,
+        outlet_name,
+        reference_id,
+        description,
+        Number(amount),
+        Number(tax_amount),
+        Number(discount_amount),
+        netAmount,
+        partnerId,
+      ]
+    );
+
+    // Update booking & folio totals
+    await client.query(
+      `UPDATE hotel_bookings SET total_amount = total_amount + $1, balance_due = balance_due + $1, updated_at = NOW() WHERE id = $2`,
+      [netAmount, booking_id]
+    );
+    await client.query(
+      `UPDATE hotel_folios SET total_charges = total_charges + $1, balance_due = balance_due + $1, updated_at = NOW() WHERE id = $2`,
+      [netAmount, folioId]
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json({ success: true, message: 'Charge posted to folio successfully.', item_id: itemId });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Folio charge post error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to post folio charge' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/resto/hotel/folios/split (Split Charges across Windows)
+app.post('/api/resto/hotel/folios/split', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { item_ids, folio_item_id, target_window = 2 } = req.body || {};
+  const targetIds = Array.isArray(item_ids) ? item_ids : (folio_item_id ? [folio_item_id] : []);
+
+  if (targetIds.length === 0) {
+    return res.status(400).json({ error: 'item_ids array or folio_item_id is required.' });
+  }
+
+  try {
+    await db.query(
+      `UPDATE hotel_folio_items SET window_number = $1 WHERE id = ANY($2::text[]) AND restaurant_id = $3`,
+      [Number(target_window) || 2, targetIds, partnerId]
+    );
+    return res.json({ success: true, message: `Moved ${targetIds.length} item(s) to Folio Window ${target_window}.` });
+  } catch (err: any) {
+    console.error('Folio split error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to split folio items' });
+  }
+});
+
+// POST /api/resto/hotel/folios/settle (Settle Window or Entire Folio & Checkout)
+app.post('/api/resto/hotel/folios/settle', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const {
+    booking_id,
+    window_number = null,
+    amount_paid,
+    payment_mode = 'cash',
+    discount_amount = 0,
+    checkout_guest = false,
+    notes = '',
+  } = req.body || {};
+
+  if (!booking_id || Number(amount_paid) < 0) {
+    return res.status(400).json({ error: 'booking_id and valid amount_paid are required.' });
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    const booking = (await client.query('SELECT * FROM hotel_bookings WHERE id = $1 AND restaurant_id = $2 FOR UPDATE', [booking_id, partnerId])).rows[0];
+    if (!booking) throw new Error('Booking not found.');
+
+    const folio = (await client.query('SELECT * FROM hotel_folios WHERE booking_id = $1 AND restaurant_id = $2 FOR UPDATE', [booking_id, partnerId])).rows[0];
+    const folioId = folio?.id || randomUUID();
+
+    const paymentItemId = randomUUID();
+    const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+
+    // 1. Record payment transaction in folio items
+    if (Number(amount_paid) > 0) {
+      await client.query(
+        `INSERT INTO hotel_folio_items
+         (id, folio_id, restaurant_id, booking_id, window_number, charge_category, source_module, reference_id, description, amount, total_amount, payment_status, posted_by, created_at)
+         VALUES ($1, $2, $3, $4, $5, 'payment', 'front_desk', $6, $7, $8, $8, 'settled', $9, NOW())`,
+        [
+          paymentItemId,
+          folioId,
+          partnerId,
+          booking_id,
+          window_number ? Number(window_number) : 1,
+          invoiceNumber,
+          `Payment Received via ${payment_mode.toUpperCase()} (Tax Invoice #${invoiceNumber})`,
+          Number(amount_paid),
+          partnerId,
+        ]
+      );
+    }
+
+    // 2. Mark folio items in this window as settled
+    if (window_number) {
+      await client.query(
+        `UPDATE hotel_folio_items SET payment_status = 'settled' WHERE booking_id = $1 AND window_number = $2 AND restaurant_id = $3`,
+        [booking_id, Number(window_number), partnerId]
+      );
+    } else {
+      await client.query(
+        `UPDATE hotel_folio_items SET payment_status = 'settled' WHERE booking_id = $1 AND restaurant_id = $2`,
+        [booking_id, partnerId]
+      );
+    }
+
+    // 3. Update booking paid & balance due
+    const newPaid = Number(booking.paid_amount || 0) + Number(amount_paid);
+    const newBalance = Math.max(0, Number(booking.total_amount || 0) - newPaid - Number(discount_amount));
+
+    await client.query(
+      `UPDATE hotel_bookings
+       SET paid_amount = $1, balance_due = $2, payment_mode = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [newPaid, newBalance, payment_mode, booking_id]
+    );
+
+    // 4. If checkout requested and balance is zero or settled
+    if (checkout_guest || newBalance === 0) {
+      await client.query(
+        `UPDATE hotel_bookings
+         SET status = 'checked_out', reservation_status = 'CHECKED_OUT', actual_check_out = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [booking_id]
+      );
+
+      if (booking.room_id) {
+        await client.query(
+          `UPDATE hotel_rooms SET status = 'cleaning', room_status = 'VACANT_DIRTY', cleaning_status = 'dirty', updated_at = NOW() WHERE id = $1`,
+          [booking.room_id]
+        );
+        await client.query(
+          `INSERT INTO housekeeping_tasks (id, restaurant_id, room_id, room_number, task_type, priority, status, notes, created_at)
+           VALUES ($1, $2, $3, $4, 'checkout_cleaning', 'high', 'pending', $5, NOW())`,
+          [randomUUID(), partnerId, booking.room_id, booking.room_number || 'Room', `Departure cleaning for guest ${booking.guest_name}`]
+        );
+      }
+    }
+
+    await logAdminActivity(
+      partnerId,
+      partnerId,
+      booking.guest_name,
+      'Folio Settlement',
+      'hotel_folio',
+      folioId,
+      `Folio settled for guest ${booking.guest_name}: ${formatCurrency(Number(amount_paid))} paid via ${payment_mode} (Invoice #${invoiceNumber})`,
+      req.ip
+    );
+
+    await client.query('COMMIT');
+    return res.json({
+      success: true,
+      message: `Folio settled successfully. Tax Invoice #${invoiceNumber} generated.`,
+      invoice_number: invoiceNumber,
+      amount_paid: Number(amount_paid),
+      balance_due: newBalance,
+      is_checked_out: checkout_guest || newBalance === 0,
+    });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Folio settle error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to settle folio' });
+  } finally {
+    client.release();
+  }
+});
+
+// ============================================================
+// HOUSEKEEPING & 10-STATE ROOM INSPECTION APIS
+// ============================================================
+
+// PATCH /api/resto/hotel/rooms/:id/cleaning-status
+app.patch('/api/resto/hotel/rooms/:id/cleaning-status', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+  const { id } = req.params;
+  const { cleaning_status, notes } = req.body || {};
+
+  const valid10States = [
+    'VACANT_CLEAN',
+    'VACANT_DIRTY',
+    'CLEANING',
+    'CLEAN',
+    'INSPECTION',
+    'INSPECTED',
+    'OCCUPIED_CLEAN',
+    'OCCUPIED_DIRTY',
+    'OUT_OF_ORDER',
+    'OUT_OF_SERVICE',
+  ];
+
+  const normalized = String(cleaning_status || '').toUpperCase();
+  if (!valid10States.includes(normalized)) {
+    return res.status(400).json({ error: `Invalid status. Must be one of: ${valid10States.join(', ')}` });
+  }
+
+  try {
+    let mainStatus = 'available';
+    if (normalized.includes('OCCUPIED')) mainStatus = 'occupied';
+    else if (normalized === 'OUT_OF_ORDER' || normalized === 'OUT_OF_SERVICE') mainStatus = 'maintenance';
+    else if (normalized === 'VACANT_CLEAN' || normalized === 'INSPECTED' || normalized === 'CLEAN') mainStatus = 'available';
+    else mainStatus = 'cleaning';
+
+    const isInspected = normalized === 'INSPECTED' || normalized === 'VACANT_CLEAN';
+
+    const updated = (await db.query(
+      `UPDATE hotel_rooms
+       SET room_status = $1,
+           cleaning_status = $2,
+           status = $3,
+           inspected_by = CASE WHEN $4 THEN $5 ELSE inspected_by END,
+           inspected_at = CASE WHEN $4 THEN NOW() ELSE inspected_at END,
+           updated_at = NOW()
+       WHERE id = $6 AND restaurant_id = $7
+       RETURNING *`,
+      [normalized, normalized.toLowerCase(), mainStatus, isInspected, partnerId, id, partnerId]
+    )).rows[0];
+
+    if (!updated) return res.status(404).json({ error: 'Room not found' });
+
+    return res.json({ success: true, data: updated, message: `Room ${updated.room_number} updated to ${normalized}.` });
+  } catch (err: any) {
+    console.error('Room cleaning status update error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to update cleaning status' });
+  }
+});
+
+// POST /api/resto/hotel/housekeeping/inspect (Supervisor Approval Gate)
+app.post('/api/resto/hotel/housekeeping/inspect', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { room_id, passed = true, supervisor_notes = '', checklist_results = [] } = req.body || {};
+  if (!room_id) return res.status(400).json({ error: 'room_id is required' });
+
+  try {
+    const nextRoomStatus = passed ? 'VACANT_CLEAN' : 'VACANT_DIRTY';
+    const nextCleaning = passed ? 'inspected' : 'dirty';
+    const nextMain = passed ? 'available' : 'cleaning';
+
+    const updated = (await db.query(
+      `UPDATE hotel_rooms
+       SET room_status = $1,
+           cleaning_status = $2,
+           status = $3,
+           inspected_by = $4,
+           inspected_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $5 AND restaurant_id = $6
+       RETURNING *`,
+      [nextRoomStatus, nextCleaning, nextMain, partnerId, room_id, partnerId]
+    )).rows[0];
+
+    // If failed inspection, auto-create high priority rework task
+    if (!passed) {
+      await db.query(
+        `INSERT INTO housekeeping_tasks (id, restaurant_id, room_id, room_number, task_type, priority, status, notes, created_at)
+         VALUES ($1, $2, $3, $4, 'rework_cleaning', 'urgent', 'pending', $5, NOW())`,
+        [randomUUID(), partnerId, room_id, updated?.room_number || 'Room', `Failed Inspection: ${supervisor_notes || 'Re-clean required'}`]
+      );
+    }
+
+    return res.json({
+      success: true,
+      message: passed ? `Room ${updated.room_number} passed inspection and is ready for check-in.` : `Room ${updated.room_number} failed inspection and marked dirty.`,
+      data: updated,
+    });
+  } catch (err: any) {
+    console.error('Housekeeping inspect error:', err);
+    return res.status(500).json({ error: err?.message || 'Inspection failed' });
+  }
+});
+
+function getItemStation(itemName: string): string {
+  const name = (itemName || '').toLowerCase();
+  if (
+    name.includes('drink') || name.includes('juice') || name.includes('beer') ||
+    name.includes('cocktail') || name.includes('mocktail') || name.includes('wine') ||
+    name.includes('whiskey') || name.includes('vodka') || name.includes('rum') ||
+    name.includes('beverage') || name.includes('tea') || name.includes('coffee') ||
+    name.includes('soda') || name.includes('shake') || name.includes('water') ||
+    name.includes('lassi') || name.includes('mojito') || name.includes('cooler')
+  ) {
+    return 'bar';
+  }
+  if (
+    name.includes('salad') || name.includes('dessert') || name.includes('ice cream') ||
+    name.includes('cold') || name.includes('raita') || name.includes('curd') ||
+    name.includes('pudding') || name.includes('kheer') || name.includes('halwa') ||
+    name.includes('gulab') || name.includes('sweet')
+  ) {
+    return 'dessert';
+  }
+  if (
+    name.includes('tandoor') || name.includes('tikka') || name.includes('naan') ||
+    name.includes('roti') || name.includes('kebab') || name.includes('kabab') ||
+    name.includes('kulcha') || name.includes('paratha') || name.includes('pizza')
+  ) {
+    return 'tandoor';
+  }
+  return 'kitchen';
+}
+
+// GET /api/resto/kds/tickets (Priority Queue with Station Filtering)
+app.get('/api/resto/kds/tickets', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const station = String(req.query.station || 'all').toLowerCase().trim();
+
+  try {
+    // 1. Fetch active tickets sorted by priority and oldest fired time
+    const tickets = (await db.query(
+      `SELECT * FROM kot_tickets
+       WHERE restaurant_id = $1 AND status IN ('pending', 'preparing', 'ready', 'partially_ready')
+       ORDER BY 
+         CASE priority
+           WHEN 'URGENT' THEN 1
+           WHEN 'HIGH' THEN 2
+           WHEN 'NORMAL' THEN 3
+           WHEN 'LOW' THEN 4
+           ELSE 5
+         END ASC,
+         created_at ASC`,
+      [partnerId]
+    )).rows;
+
+    const ticketIds = tickets.map((t: any) => t.id);
+    let itemsByKot: Record<string, any[]> = {};
+
+    if (ticketIds.length > 0) {
+      const items = (await db.query(
+        `SELECT * FROM kot_items WHERE restaurant_id = $1 AND kot_id = ANY($2::text[])`,
+        [partnerId, ticketIds]
+      )).rows;
+
+      items.forEach((itm: any) => {
+        const itemStation = itm.station_code || getItemStation(itm.item_name);
+        if (station === 'all' || station === 'expeditor' || itemStation === station) {
+          if (!itemsByKot[itm.kot_id]) itemsByKot[itm.kot_id] = [];
+          itemsByKot[itm.kot_id].push({
+            ...itm,
+            station: itemStation,
+          });
+        }
+      });
+    }
+
+    // Filter out tickets with 0 items for the selected station
+    const stationTickets = tickets
+      .map((t: any) => ({
+        ...t,
+        items: itemsByKot[t.id] || [],
+      }))
+      .filter((t: any) => station === 'all' || station === 'expeditor' || t.items.length > 0);
+
+    return res.json({ success: true, data: stationTickets, count: stationTickets.length });
+  } catch (err: any) {
+    console.error('KDS tickets fetch error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to fetch KDS tickets' });
+  }
+});
+
+// GET /api/resto/kds/all-day-production (Consolidated Dish Aggregation)
+app.get('/api/resto/kds/all-day-production', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const station = String(req.query.station || 'all').toLowerCase().trim();
+
+  try {
+    const query = `
+      SELECT 
+        ki.item_name,
+        ki.unit,
+        COALESCE(ki.station_code, 'kitchen') as station,
+        SUM(ki.quantity) as total_quantity,
+        COUNT(DISTINCT kt.id) as total_tickets,
+        json_agg(json_build_object(
+          'kot_id', kt.id,
+          'kot_number', kt.kot_number,
+          'table_number', kt.table_number,
+          'order_type', kt.order_type,
+          'quantity', ki.quantity,
+          'status', ki.status,
+          'created_at', kt.created_at
+        )) as orders
+      FROM kot_items ki
+      JOIN kot_tickets kt ON kt.id = ki.kot_id
+      WHERE kt.restaurant_id = $1
+        AND kt.status IN ('pending', 'preparing', 'partially_ready')
+        AND ki.status IN ('pending', 'preparing')
+      GROUP BY ki.item_name, ki.unit, COALESCE(ki.station_code, 'kitchen')
+      ORDER BY total_quantity DESC
+    `;
+
+    const rawRows = (await db.query(query, [partnerId])).rows;
+    const filtered = rawRows.filter((r: any) => station === 'all' || r.station === station);
+
+    return res.json({ success: true, data: filtered });
+  } catch (err: any) {
+    console.error('All Day production error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to aggregate all day production' });
+  }
+});
+
+// PATCH /api/resto/kds/items/:itemId/bump (Item-Level Bumping)
+app.patch('/api/resto/kds/items/:itemId/bump', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { itemId } = req.params;
+  const { target_status } = req.body || {};
+
+  try {
+    const item = (await db.query('SELECT * FROM kot_items WHERE id = $1 AND restaurant_id = $2', [itemId, partnerId])).rows[0];
+    if (!item) return res.status(404).json({ error: 'KOT item not found' });
+
+    let nextStatus = target_status;
+    if (!nextStatus) {
+      if (item.status === 'pending') nextStatus = 'preparing';
+      else if (item.status === 'preparing') nextStatus = 'ready';
+      else if (item.status === 'ready') nextStatus = 'served';
+      else nextStatus = 'ready';
+    }
+
+    const updatedItem = (await db.query(
+      `UPDATE kot_items SET status = $1, bumped_at = NOW() WHERE id = $2 AND restaurant_id = $3 RETURNING *`,
+      [nextStatus, itemId, partnerId]
+    )).rows[0];
+
+    // Recalculate parent ticket status
+    const allItems = (await db.query('SELECT status FROM kot_items WHERE kot_id = $1 AND restaurant_id = $2', [item.kot_id, partnerId])).rows;
+    const allReady = allItems.every((i: any) => i.status === 'ready' || i.status === 'served');
+    const anyPreparing = allItems.some((i: any) => i.status === 'preparing' || i.status === 'ready');
+
+    let ticketStatus = 'pending';
+    if (allReady) ticketStatus = 'ready';
+    else if (anyPreparing) ticketStatus = 'partially_ready';
+
+    await db.query(
+      `UPDATE kot_tickets SET status = $1, ready_at = CASE WHEN $1 = 'ready' THEN NOW() ELSE ready_at END, updated_at = NOW() WHERE id = $2 AND restaurant_id = $3`,
+      [ticketStatus, item.kot_id, partnerId]
+    );
+
+    return res.json({ success: true, item: updatedItem, ticket_status: ticketStatus });
+  } catch (err: any) {
+    console.error('KDS bump error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to bump KDS item' });
+  }
+});
+
+// PATCH /api/resto/kds/tickets/:ticketId/priority (Priority Override with Mandatory Audit)
+app.patch('/api/resto/kds/tickets/:ticketId/priority', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { ticketId } = req.params;
+  const { priority, reason } = req.body || {};
+
+  if (!priority || !reason) {
+    return res.status(400).json({ error: 'priority (URGENT, HIGH, NORMAL, LOW) and reason are required.' });
+  }
+
+  try {
+    const ticket = (await db.query('SELECT * FROM kot_tickets WHERE id = $1 AND restaurant_id = $2', [ticketId, partnerId])).rows[0];
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+
+    const oldPrio = ticket.priority || 'NORMAL';
+    const newPrio = String(priority).toUpperCase();
+
+    // 1. Record Priority Change Audit Log
+    await db.query(
+      `INSERT INTO kds_priority_logs (id, restaurant_id, ticket_id, kot_number, old_priority, new_priority, reason, changed_by, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [randomUUID(), partnerId, ticketId, ticket.kot_number, oldPrio, newPrio, reason, partnerId]
+    );
+
+    // 2. Update Ticket Priority
+    const updated = (await db.query(
+      `UPDATE kot_tickets SET priority = $1, updated_at = NOW() WHERE id = $2 AND restaurant_id = $3 RETURNING *`,
+      [newPrio, ticketId, partnerId]
+    )).rows[0];
+
+    return res.json({ success: true, data: updated, message: `Ticket #${ticket.kot_number} priority elevated to ${newPrio}.` });
+  } catch (err: any) {
+    console.error('KDS priority update error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to update priority' });
+  }
+});
+
+// ============================================================
+// BAR & LIQUOR DAILY CLOSING & PEG VARIANCE APIS
+// ============================================================
+
+// POST /api/resto/bar/daily-closing
+app.post('/api/resto/bar/daily-closing', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { closing_date = new Date().toISOString().slice(0, 10), outlet_id = null, entries = [] } = req.body || {};
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return res.status(400).json({ error: 'Bar closing entries are required.' });
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    const recorded: any[] = [];
+    for (const e of entries) {
+      const itmId = e.item_id;
+      const itmName = e.item_name || 'Liquor Brand';
+      const openMl = Number(e.opening_ml || 0);
+      const recMl = Number(e.received_ml || 0);
+      const soldMl = Number(e.sold_ml || 0);
+      const wasteMl = Number(e.wastage_ml || 0);
+      const physMl = Number(e.physical_closing_ml || 0);
+
+      const theoClosing = openMl + recMl - soldMl - wasteMl;
+      const varMl = physMl - theoClosing;
+      const unitCostPerMl = Number(e.cost_per_ml || 0.5);
+      const costVar = varMl * unitCostPerMl;
+
+      const recordId = randomUUID();
+      const row = (await client.query(
+        `INSERT INTO bar_daily_closings
+         (id, restaurant_id, closing_date, outlet_id, item_id, item_name, opening_ml, received_ml, sold_ml, wastage_ml, theoretical_closing_ml, physical_closing_ml, variance_ml, cost_variance, closed_by, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+         RETURNING *`,
+        [recordId, partnerId, closing_date, outlet_id, itmId, itmName, openMl, recMl, soldMl, wasteMl, theoClosing, physMl, varMl, costVar, partnerId]
+      )).rows[0];
+
+      recorded.push(row);
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({ success: true, message: `Bar closing recorded for ${recorded.length} brands.`, data: recorded });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Bar closing error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to record bar closing' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/resto/bar/variance-report
+app.get('/api/resto/bar/variance-report', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const report = (await db.query(
+      `SELECT * FROM bar_daily_closings WHERE restaurant_id = $1 ORDER BY closing_date DESC, item_name ASC LIMIT 100`,
+      [partnerId]
+    )).rows;
+
+    const totalVolumeVariance = report.reduce((s, r) => s + Number(r.variance_ml || 0), 0);
+    const totalCostVariance = report.reduce((s, r) => s + Number(r.cost_variance || 0), 0);
+
+    return res.json({
+      success: true,
+      data: report,
+      summary: {
+        total_brands: report.length,
+        total_volume_variance_ml: totalVolumeVariance,
+        total_cost_variance: totalCostVariance,
+      },
+    });
+  } catch (err: any) {
+    console.error('Bar variance report error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to fetch bar variance report' });
+  }
+});
+
+// ============================================================
+// AUTOMATED 5-STEP NIGHT AUDIT & BUSINESS DATE CONTROL
+// ============================================================
+
+// GET /api/resto/night-audit/status
+app.get('/api/resto/night-audit/status', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    let bizDateRow = (await first('SELECT * FROM hotel_business_dates WHERE restaurant_id = $1', [partnerId]));
+    if (!bizDateRow) {
+      const today = new Date().toISOString().slice(0, 10);
+      bizDateRow = (await first(
+        `INSERT INTO hotel_business_dates (id, restaurant_id, current_business_date, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW()) RETURNING *`,
+        [randomUUID(), partnerId, today]
+      ));
+    }
+
+    const curBizDate = bizDateRow.current_business_date;
+
+    // Reconciliation Checks
+    const [pendingArrivals, pendingDepartures, inHouseGuests, openFolios, todayPOS] = await Promise.all([
+      db.query(`SELECT COUNT(*) as count FROM hotel_bookings WHERE restaurant_id = $1 AND check_in_date = $2 AND status = 'reserved'`, [partnerId, curBizDate]),
+      db.query(`SELECT COUNT(*) as count FROM hotel_bookings WHERE restaurant_id = $1 AND check_out_date = $2 AND status = 'checked_in'`, [partnerId, curBizDate]),
+      db.query(`SELECT COUNT(*) as count FROM hotel_bookings WHERE restaurant_id = $1 AND status = 'checked_in'`, [partnerId]),
+      db.query(`SELECT COUNT(*) as count FROM hotel_folios WHERE restaurant_id = $1 AND status = 'open' AND balance_due > 0`, [partnerId]),
+      db.query(`SELECT COALESCE(SUM(total_amount), 0) as total, COUNT(*) as count FROM sales_orders WHERE restaurant_id = $1 AND DATE(created_at) = $2`, [partnerId, curBizDate]),
+    ]);
+
+    return res.json({
+      success: true,
+      data: {
+        business_date: curBizDate,
+        last_audit_date: bizDateRow.last_audit_date,
+        is_in_progress: bizDateRow.is_audit_in_progress,
+        checks: {
+          pending_arrivals: parseInt(pendingArrivals.rows[0]?.count || '0', 10),
+          pending_departures: parseInt(pendingDepartures.rows[0]?.count || '0', 10),
+          in_house_guests: parseInt(inHouseGuests.rows[0]?.count || '0', 10),
+          open_folios_with_balance: parseInt(openFolios.rows[0]?.count || '0', 10),
+          today_pos_sales: parseFloat(todayPOS.rows[0]?.total || '0'),
+          today_pos_orders: parseInt(todayPOS.rows[0]?.count || '0', 10),
+        },
+      },
+    });
+  } catch (err: any) {
+    console.error('Night audit status error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to fetch night audit status' });
+  }
+});
+
+// POST /api/resto/night-audit/run (Automated 5-Step Nightly Reconciliation & Date Roll)
+app.post('/api/resto/night-audit/run', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Fetch Current Business Date
+    let bizRow = (await client.query('SELECT * FROM hotel_business_dates WHERE restaurant_id = $1 FOR UPDATE', [partnerId])).rows[0];
+    const auditDate = bizRow?.current_business_date || new Date().toISOString().slice(0, 10);
+
+    // 2. Fetch Active In-House Bookings & Auto-Post Room Charges + Taxes
+    const inHouse = (await client.query(
+      `SELECT * FROM hotel_bookings WHERE restaurant_id = $1 AND status = 'checked_in'`,
+      [partnerId]
+    )).rows;
+
+    let totalNightlyRoomCharge = 0;
+    for (const b of inHouse) {
+      const roomCharge = Number(b.room_charge || 0);
+      const roomTax = Math.round(roomCharge * 0.12);
+      const totalPost = roomCharge + roomTax;
+
+      if (roomCharge > 0 && b.master_folio_id) {
+        await client.query(
+          `INSERT INTO hotel_folio_items
+           (id, folio_id, restaurant_id, booking_id, window_number, charge_category, source_module, description, amount, tax_amount, total_amount, payment_status, created_at)
+           VALUES ($1, $2, $3, $4, 1, 'room_charge', 'night_audit', $5, $6, $7, $8, 'unpaid', NOW())`,
+          [
+            randomUUID(),
+            b.master_folio_id,
+            partnerId,
+            b.id,
+            `Night Audit Room Charge (${auditDate}): Room ${b.room_number || ''}`,
+            roomCharge,
+            roomTax,
+            totalPost,
+          ]
+        );
+
+        await client.query(
+          `UPDATE hotel_bookings SET total_amount = total_amount + $1, balance_due = balance_due + $1, updated_at = NOW() WHERE id = $2`,
+          [totalPost, b.id]
+        );
+
+        await client.query(
+          `UPDATE hotel_folios SET total_charges = total_charges + $1, balance_due = balance_due + $1, updated_at = NOW() WHERE id = $2`,
+          [totalPost, b.master_folio_id]
+        );
+
+        totalNightlyRoomCharge += roomCharge;
+      }
+    }
+
+    // 3. Compute Outlets Revenue & Statistics for the Date
+    const allRooms = (await client.query('SELECT * FROM hotel_rooms WHERE restaurant_id = $1', [partnerId])).rows;
+    const totalRooms = allRooms.length;
+    const occupiedRooms = inHouse.length;
+    const occupancyRate = totalRooms > 0 ? Number(((occupiedRooms / totalRooms) * 100).toFixed(2)) : 0;
+    const adr = occupiedRooms > 0 ? totalNightlyRoomCharge / occupiedRooms : 0;
+    const revpar = totalRooms > 0 ? totalNightlyRoomCharge / totalRooms : 0;
+
+    const posSales = (await client.query('SELECT COALESCE(SUM(total_amount), 0) as total FROM sales_orders WHERE restaurant_id = $1 AND DATE(created_at) = $2', [partnerId, auditDate])).rows[0];
+    const banquetSales = (await client.query('SELECT COALESCE(SUM(total_amount), 0) as total FROM hotel_banquets WHERE restaurant_id = $1 AND event_date = $2', [partnerId, auditDate])).rows[0];
+    const poolSales = (await client.query('SELECT COALESCE(SUM(total_amount), 0) as total FROM pool_tickets WHERE restaurant_id = $1 AND valid_date = $2', [partnerId, auditDate])).rows[0];
+
+    const posRev = Number(posSales?.total || 0);
+    const banqRev = Number(banquetSales?.total || 0);
+    const poolRev = Number(poolSales?.total || 0);
+    const totalDayRevenue = totalNightlyRoomCharge + posRev + banqRev + poolRev;
+
+    // 4. Save Night Audit Record
+    const auditNumber = `AUD-${Date.now().toString().slice(-6)}`;
+    const auditRecord = (await client.query(
+      `INSERT INTO hotel_night_audits
+       (id, restaurant_id, audit_number, audit_date, room_revenue, pos_revenue, banquet_revenue, pool_revenue, total_revenue, total_rooms, occupied_rooms, occupancy_rate, audited_by, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'completed', NOW())
+       RETURNING *`,
+      [
+        randomUUID(),
+        partnerId,
+        auditNumber,
+        auditDate,
+        totalNightlyRoomCharge,
+        posRev,
+        banqRev,
+        poolRev,
+        totalDayRevenue,
+        totalRooms,
+        occupiedRooms,
+        occupancyRate,
+        partnerId,
+      ]
+    )).rows[0];
+
+    // 5. Roll Hotel Business Date to Next Operating Day (+1 Day)
+    const nextDate = new Date(new Date(auditDate).getTime() + 86400000).toISOString().slice(0, 10);
+    await client.query(
+      `INSERT INTO hotel_business_dates (id, restaurant_id, current_business_date, last_audit_date, is_audit_in_progress, updated_at)
+       VALUES ($1, $2, $3, $4, FALSE, NOW())
+       ON CONFLICT (restaurant_id) DO UPDATE SET
+         current_business_date = EXCLUDED.current_business_date,
+         last_audit_date = EXCLUDED.last_audit_date,
+         is_audit_in_progress = FALSE,
+         updated_at = NOW()`,
+      [randomUUID(), partnerId, nextDate, auditDate]
+    );
+
+    await logAdminActivity(
+      partnerId,
+      partnerId,
+      'Night Auditor',
+      'Night Audit Completed',
+      'hotel_night_audit',
+      auditRecord.id,
+      `Night Audit #${auditNumber} executed for ${auditDate}. Revenue: ${formatCurrency(totalDayRevenue)}, Occupancy: ${occupancyRate}%, Next Date: ${nextDate}`,
+      req.ip
+    );
+
+    await client.query('COMMIT');
+    return res.json({
+      success: true,
+      message: `Night Audit #${auditNumber} completed. Business date rolled from ${auditDate} to ${nextDate}.`,
+      data: {
+        audit: auditRecord,
+        previous_business_date: auditDate,
+        new_business_date: nextDate,
+        kpis: {
+          occupancy_rate: `${occupancyRate}%`,
+          adr: parseFloat(adr.toFixed(2)),
+          revpar: parseFloat(revpar.toFixed(2)),
+          total_revenue: totalDayRevenue,
+          room_revenue: totalNightlyRoomCharge,
+          pos_revenue: posRev,
+          banquet_revenue: banqRev,
+          pool_revenue: poolRev,
+        },
+      },
+    });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Night audit execution error:', err);
+    return res.status(500).json({ error: err?.message || 'Night audit failed' });
+  } finally {
+    client.release();
+  }
+});
+
+// ============================================================
+// HOSPITALITY KPI & EXECUTIVE SUMMARY REPORT API
+// ============================================================
+app.get('/api/resto/reports/hospitality-summary', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [roomsRes, inHouseRes, salesRes, banquetsRes, poolRes, latestAuditRes] = await Promise.all([
+      db.query('SELECT COUNT(*) as count FROM hotel_rooms WHERE restaurant_id = $1', [partnerId]),
+      db.query(`SELECT COUNT(*) as count, COALESCE(SUM(room_charge), 0) as room_rev FROM hotel_bookings WHERE restaurant_id = $1 AND status = 'checked_in'`, [partnerId]),
+      db.query(`SELECT COALESCE(SUM(total_amount), 0) as total FROM sales_orders WHERE restaurant_id = $1 AND DATE(created_at) = $2`, [partnerId, today]),
+      db.query(`SELECT COALESCE(SUM(total_amount), 0) as total FROM hotel_banquets WHERE restaurant_id = $1 AND event_date = $2`, [partnerId, today]),
+      db.query(`SELECT COALESCE(SUM(total_amount), 0) as total FROM pool_tickets WHERE restaurant_id = $1 AND valid_date = $2`, [partnerId, today]),
+      db.query(`SELECT * FROM hotel_night_audits WHERE restaurant_id = $1 ORDER BY audit_date DESC LIMIT 7`, [partnerId]),
+    ]);
+
+    const totalRooms = parseInt(roomsRes.rows[0]?.count || '0', 10);
+    const inHouseCount = parseInt(inHouseRes.rows[0]?.count || '0', 10);
+    const roomRev = parseFloat(inHouseRes.rows[0]?.room_rev || '0');
+    const posRev = parseFloat(salesRes.rows[0]?.total || '0');
+    const banqRev = parseFloat(banquetsRes.rows[0]?.total || '0');
+    const poolRev = parseFloat(poolRes.rows[0]?.total || '0');
+
+    const occupancyRate = totalRooms > 0 ? Number(((inHouseCount / totalRooms) * 100).toFixed(1)) : 0;
+    const adr = inHouseCount > 0 ? Math.round(roomRev / inHouseCount) : 0;
+    const revpar = totalRooms > 0 ? Math.round(roomRev / totalRooms) : 0;
+    const totalDailyRevenue = roomRev + posRev + banqRev + poolRev;
+
+    return res.json({
+      success: true,
+      data: {
+        total_rooms: totalRooms,
+        occupied_rooms: inHouseCount,
+        occupancy_rate: occupancyRate,
+        adr,
+        revpar,
+        today_revenue: totalDailyRevenue,
+        department_breakdown: {
+          room: roomRev,
+          pos_outlets: posRev,
+          banquet: banqRev,
+          pool: poolRev,
+        },
+        historical_audits: latestAuditRes.rows,
+      },
+    });
+  } catch (err: any) {
+    console.error('Hospitality report summary error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to generate hospitality report summary' });
   }
 });
 
@@ -3716,6 +5613,15 @@ app.post('/api/resto/sales-pos/send-whatsapp', requireAuth, async (req: Authenti
 app.patch('/api/resto/kot/:id/status', requireAuth, async (req: AuthenticatedRequest, res) => {
   const partnerId = req.userId;
   if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { allowed, businessType } = await checkIndustryAccess(partnerId, 'kot_tickets');
+  if (!allowed) {
+    return res.status(403).json({
+      error: `Access Denied: KOT status updates are not available for business vertical '${businessType}'.`,
+      code: 'INDUSTRY_RESTRICTED',
+    });
+  }
+
   const { id } = req.params;
   const { status } = req.body || {};
 
@@ -3739,6 +5645,271 @@ app.patch('/api/resto/kot/:id/status', requireAuth, async (req: AuthenticatedReq
     return res.json({ success: true, data: updated });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'Failed to update KOT status' });
+  }
+});
+
+// PATCH /api/resto/kot/items/:itemId/status (Item-Level Bumping)
+app.patch('/api/resto/kot/items/:itemId/status', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { itemId } = req.params;
+  const { status } = req.body || {};
+
+  const validStatuses = ['pending', 'preparing', 'ready', 'served', 'cancelled'];
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `Invalid item status. Must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  try {
+    const updatedItem = await first(
+      `UPDATE kot_items SET status = $1 WHERE id = $2 AND restaurant_id = $3 RETURNING *`,
+      [status, itemId, partnerId]
+    );
+    if (!updatedItem) return res.status(404).json({ error: 'KOT Item not found' });
+
+    // Check if all items in this KOT ticket are now ready
+    const allItems = (await db.query(`SELECT status FROM kot_items WHERE kot_id = $1 AND restaurant_id = $2`, [updatedItem.kot_id, partnerId])).rows;
+    const allReady = allItems.length > 0 && allItems.every((i: any) => i.status === 'ready' || i.status === 'served');
+    const anyPreparing = allItems.some((i: any) => i.status === 'preparing' || i.status === 'ready');
+
+    let newTicketStatus = null;
+    if (allReady) {
+      newTicketStatus = 'ready';
+    } else if (anyPreparing) {
+      newTicketStatus = 'preparing';
+    }
+
+    if (newTicketStatus) {
+      await db.query(
+        `UPDATE kot_tickets SET status = $1, updated_at = NOW() WHERE id = $2 AND restaurant_id = $3 AND status != 'served'`,
+        [newTicketStatus, updatedItem.kot_id, partnerId]
+      );
+    }
+
+    return res.json({ success: true, data: updatedItem, ticketStatus: newTicketStatus });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to update KOT item status' });
+  }
+});
+
+// POST /api/resto/kot/:id/recall (Recall served/cancelled KOT back to active board)
+app.post('/api/resto/kot/:id/recall', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+  const targetStatus = req.body?.targetStatus || 'preparing';
+
+  try {
+    const updated = await first(
+      `UPDATE kot_tickets SET status = $1, updated_at = NOW() WHERE id = $2 AND restaurant_id = $3 RETURNING *`,
+      [targetStatus, id, partnerId]
+    );
+    if (!updated) return res.status(404).json({ error: 'KOT Ticket not found' });
+
+    await db.query(
+      `UPDATE kot_items SET status = $1 WHERE kot_id = $2 AND restaurant_id = $3`,
+      [targetStatus, id, partnerId]
+    );
+
+    return res.json({ success: true, data: updated });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to recall KOT ticket' });
+  }
+});
+
+// GET /api/resto/kot/history (Fetch completed/served & cancelled KOT tickets)
+app.get('/api/resto/kot/history', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const tickets = (
+      await db.query(
+        `SELECT * FROM kot_tickets WHERE restaurant_id = $1 AND status IN ('served', 'cancelled') ORDER BY updated_at DESC LIMIT 50`,
+        [partnerId]
+      )
+    ).rows;
+
+    const ticketIds = tickets.map((t: any) => t.id);
+    let itemsByKot: Record<string, any[]> = {};
+    if (ticketIds.length > 0) {
+      const items = (
+        await db.query(
+          `SELECT * FROM kot_items WHERE restaurant_id = $1 AND kot_id = ANY($2::text[])`,
+          [partnerId, ticketIds]
+        )
+      ).rows;
+      items.forEach((itm: any) => {
+        if (!itemsByKot[itm.kot_id]) itemsByKot[itm.kot_id] = [];
+        itemsByKot[itm.kot_id].push(itm);
+      });
+    }
+
+    const fullTickets = tickets.map((t: any) => ({
+      ...t,
+      items: itemsByKot[t.id] || [],
+    }));
+
+    return res.json({ success: true, data: fullTickets });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to fetch KOT history' });
+  }
+});
+
+// GET /api/resto/kot (Full KOT Register with Advanced Filtering & Metrics)
+app.get('/api/resto/kot', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const status = String(req.query.status || 'all').toLowerCase().trim();
+  const orderType = String(req.query.order_type || 'all').toLowerCase().trim();
+  const search = String(req.query.search || '').toLowerCase().trim();
+  const limit = Math.min(Number(req.query.limit || 100), 200);
+
+  try {
+    let query = `SELECT * FROM kot_tickets WHERE restaurant_id = $1`;
+    const params: any[] = [partnerId];
+
+    if (status === 'active') {
+      params.push(['pending', 'preparing', 'ready']);
+      query += ` AND status = ANY($${params.length}::text[])`;
+    } else if (status !== 'all' && ['pending', 'preparing', 'ready', 'served', 'cancelled'].includes(status)) {
+      params.push(status);
+      query += ` AND status = $${params.length}`;
+    }
+
+    if (orderType !== 'all') {
+      params.push(orderType);
+      query += ` AND order_type = $${params.length}`;
+    }
+
+    if (search) {
+      params.push(`%${search}%`);
+      query += ` AND (LOWER(kot_number) LIKE $${params.length} OR LOWER(COALESCE(table_number, '')) LIKE $${params.length} OR LOWER(COALESCE(server_name, '')) LIKE $${params.length})`;
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT ${limit}`;
+
+    const tickets = (await db.query(query, params)).rows;
+    const ticketIds = tickets.map((t: any) => t.id);
+
+    let itemsByKot: Record<string, any[]> = {};
+    if (ticketIds.length > 0) {
+      const items = (
+        await db.query(
+          `SELECT * FROM kot_items WHERE restaurant_id = $1 AND kot_id = ANY($2::text[])`,
+          [partnerId, ticketIds]
+        )
+      ).rows;
+      items.forEach((itm: any) => {
+        if (!itemsByKot[itm.kot_id]) itemsByKot[itm.kot_id] = [];
+        itemsByKot[itm.kot_id].push({
+          ...itm,
+          station: itm.station_code || getItemStation(itm.item_name),
+        });
+      });
+    }
+
+    const fullTickets = tickets.map((t: any) => ({
+      ...t,
+      items: itemsByKot[t.id] || [],
+    }));
+
+    // Aggregate overall counts for today
+    const statsRes = await db.query(
+      `SELECT 
+        COUNT(*) as total_today,
+        COUNT(*) FILTER (WHERE status IN ('pending', 'preparing', 'ready')) as active_count,
+        COUNT(*) FILTER (WHERE status = 'ready') as ready_count,
+        COUNT(*) FILTER (WHERE status = 'served') as served_count,
+        COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled_count
+       FROM kot_tickets 
+       WHERE restaurant_id = $1 AND created_at >= CURRENT_DATE`,
+      [partnerId]
+    );
+
+    return res.json({
+      success: true,
+      data: fullTickets,
+      count: fullTickets.length,
+      stats: statsRes.rows[0] || {},
+    });
+  } catch (err: any) {
+    console.error('KOT register fetch error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to fetch KOT register' });
+  }
+});
+
+// POST /api/resto/kot/:id/void (Void/Cancel KOT with Audit Reason)
+app.post('/api/resto/kot/:id/void', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+  const reason = req.body?.reason?.trim() || 'Voided by Manager';
+
+  try {
+    const existing = await first(`SELECT * FROM kot_tickets WHERE id = $1 AND restaurant_id = $2`, [id, partnerId]);
+    if (!existing) return res.status(404).json({ error: 'KOT ticket not found' });
+
+    const notes = existing.notes ? `${existing.notes} | [VOID REASON: ${reason}]` : `[VOID REASON: ${reason}]`;
+
+    const updated = await first(
+      `UPDATE kot_tickets SET status = 'cancelled', notes = $1, updated_at = NOW() WHERE id = $2 AND restaurant_id = $3 RETURNING *`,
+      [notes, id, partnerId]
+    );
+
+    await db.query(
+      `UPDATE kot_items SET status = 'cancelled' WHERE kot_id = $1 AND restaurant_id = $2`,
+      [id, partnerId]
+    );
+
+    // Audit logging
+    await db.query(
+      `INSERT INTO activity_logs (restaurant_id, user_id, action, entity_type, entity_id, details)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [partnerId, partnerId, 'VOID_KOT', 'kot_ticket', id, JSON.stringify({ kot_number: existing.kot_number, reason })]
+    );
+
+    return res.json({ success: true, message: `KOT #${existing.kot_number} voided successfully.`, data: updated });
+  } catch (err: any) {
+    console.error('KOT void error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to void KOT' });
+  }
+});
+
+// POST /api/resto/kot/:id/reassign (Transfer KOT to different Table or Room)
+app.post('/api/resto/kot/:id/reassign', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const partnerId = req.userId;
+  if (!partnerId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+  const { table_number, table_name, order_type } = req.body || {};
+
+  if (!table_number && !table_name) {
+    return res.status(400).json({ error: 'New Table or Room number is required.' });
+  }
+
+  try {
+    const updated = await first(
+      `UPDATE kot_tickets 
+       SET table_number = COALESCE($1, table_number), 
+           table_name = COALESCE($2, table_name),
+           order_type = COALESCE($3, order_type),
+           updated_at = NOW() 
+       WHERE id = $4 AND restaurant_id = $5 
+       RETURNING *`,
+      [table_number || null, table_name || null, order_type || null, id, partnerId]
+    );
+
+    if (!updated) return res.status(404).json({ error: 'KOT ticket not found' });
+
+    return res.json({ success: true, message: `KOT successfully reassigned to ${table_name || table_number}.`, data: updated });
+  } catch (err: any) {
+    console.error('KOT reassign error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to reassign KOT' });
   }
 });
 
@@ -4841,128 +7012,113 @@ app.delete('/api/suppliers/:id', requireAuth, async (req: AuthenticatedRequest, 
 
 // ============================================================
 // SUPER ADMIN PORTAL API ENDPOINTS
-// ============================================================
-
-// 1. Dashboard Master KPIs & Charts
+// ============================================================// 1. Dashboard Master KPIs & Charts
 app.get('/api/admin/dashboard/stats', async (_req, res) => {
   try {
-    const totalRestoRes = await db.query('SELECT COUNT(*) FROM partners');
-    const activeRestoRes = await db.query("SELECT COUNT(*) FROM partners WHERE status = 'active' OR onboarding_completed = true");
-    const trialSubRes = await db.query("SELECT COUNT(*) FROM subscriptions WHERE status = 'trial'");
-    const expiredSubRes = await db.query("SELECT COUNT(*) FROM subscriptions WHERE status = 'expired'");
-    const suspendedRes = await db.query("SELECT COUNT(*) FROM partners WHERE status = 'suspended'");
-    
-    // Revenue from active subscriptions
-    const subRevRes = await db.query(`
-      SELECT COALESCE(SUM(COALESCE(s.amount, sp.price, 0)), 0)::numeric as mrr 
-      FROM subscriptions s 
-      LEFT JOIN subscription_plans sp ON LOWER(s.plan) = LOWER(sp.name) 
-      WHERE s.status IN ('active', 'trial')
-    `);
-    
-    // Total platform GMV from sales_orders
-    const ordersRes = await db.query("SELECT COUNT(*) as order_count, COALESCE(SUM(total_amount), 0)::numeric as total_sales FROM sales_orders WHERE created_at >= NOW() - INTERVAL '30 days'");
+    const [
+      kpiRes,
+      planDistRes,
+      recentRestos,
+      recentPayments,
+      recentActivityLogs,
+      monthlySeriesRes,
+      expiringRestos,
+      openTicketsRes
+    ] = await Promise.all([
+      db.query(`
+        SELECT
+          (SELECT COUNT(*)::int FROM partners) as total_restaurants,
+          (SELECT COUNT(*)::int FROM partners WHERE status = 'active' OR onboarding_completed = true) as active_restaurants,
+          (SELECT COUNT(*)::int FROM subscriptions WHERE status = 'trial') as trial_restaurants,
+          (SELECT COUNT(*)::int FROM subscriptions WHERE status = 'expired') as expired,
+          (SELECT COUNT(*)::int FROM partners WHERE status = 'suspended') as suspended,
+          (SELECT COALESCE(SUM(COALESCE(s.amount, sp.price, 0)), 0)::numeric FROM subscriptions s LEFT JOIN subscription_plans sp ON LOWER(s.plan) = LOWER(sp.name) WHERE s.status IN ('active', 'trial')) as mrr,
+          (SELECT COALESCE(SUM(total_amount), 0)::numeric FROM sales_orders WHERE created_at >= NOW() - INTERVAL '30 days') as monthly_revenue,
+          (SELECT COALESCE(SUM(amount), 0)::numeric FROM invoices WHERE status = 'pending') as pending_payments
+      `),
+      db.query(`
+        SELECT COALESCE(INITCAP(s.plan), 'Starter') as label, COUNT(*)::int as value
+        FROM subscriptions s
+        GROUP BY COALESCE(INITCAP(s.plan), 'Starter')
+        ORDER BY value DESC
+      `),
+      db.query(`
+        SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email, p.phone,
+               TO_CHAR(p.created_at, 'YYYY-MM-DD') as created,
+               p.city, p.business_type as "businessType",
+               COALESCE(p.status, 'active') as status,
+               COALESCE(s.plan, 'Starter') as plan, COALESCE(s.status, 'active') as "subStatus"
+        FROM partners p
+        LEFT JOIN subscriptions s ON p.id = s.partner_id
+        ORDER BY p.created_at DESC LIMIT 5
+      `),
+      db.query(`
+        SELECT o.id, o.order_number as invoice, o.total_amount as amount, o.payment_mode as method,
+               'Completed' as status, TO_CHAR(o.created_at, 'YYYY-MM-DD') as date, p.restaurant_name as restaurant
+        FROM sales_orders o
+        LEFT JOIN partners p ON o.restaurant_id = p.id
+        ORDER BY o.created_at DESC LIMIT 5
+      `),
+      db.query(`
+        SELECT a.id, COALESCE(p.restaurant_name, 'System') as restaurant,
+               COALESCE(u.full_name, a.user_name, 'Admin') as user, a.action, a.description as detail,
+               a.ip_address as ip,
+               'Success' as status,
+               TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI') as timestamp,
+               a.created_at as date
+        FROM activity_logs a
+        LEFT JOIN partners p ON a.restaurant_id = p.id
+        LEFT JOIN restaurant_users u ON a.user_id = u.id
+        ORDER BY a.created_at DESC LIMIT 6
+      `),
+      db.query(`
+        WITH months AS (
+          SELECT generate_series(
+            DATE_TRUNC('month', NOW() - INTERVAL '5 months'),
+            DATE_TRUNC('month', NOW()),
+            '1 month'::interval
+          ) as m
+        )
+        SELECT TO_CHAR(months.m, 'Mon') as label,
+               COALESCE((SELECT COUNT(*)::int FROM partners WHERE DATE_TRUNC('month', created_at) = months.m), 0) as new_restaurants,
+               COALESCE((SELECT SUM(total_amount)::numeric FROM sales_orders WHERE DATE_TRUNC('month', created_at) = months.m), 0) as sales,
+               COALESCE((SELECT COUNT(*)::int FROM subscriptions WHERE created_at <= months.m + INTERVAL '1 month' AND status IN ('active', 'trial')), 0) as subs
+        FROM months
+        ORDER BY months.m ASC
+      `),
+      db.query(`
+        SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email,
+               COALESCE(s.plan, 'Starter') as plan,
+               TO_CHAR(s.expiry_date, 'YYYY-MM-DD') as "subExpiry",
+               COALESCE(s.status, 'active') as "subStatus"
+        FROM partners p
+        JOIN subscriptions s ON p.id = s.partner_id
+        WHERE s.expiry_date IS NOT NULL
+        ORDER BY s.expiry_date ASC LIMIT 5
+      `),
+      db.query(`
+        SELECT t.id, t.ticket_number as "ticketId", COALESCE(p.restaurant_name, 'Partner') as restaurant,
+               t.subject, t.priority, t.status,
+               TO_CHAR(t.created_at, 'YYYY-MM-DD') as created
+        FROM support_tickets t
+        LEFT JOIN partners p ON t.partner_id = p.id
+        ORDER BY t.created_at DESC LIMIT 5
+      `),
+    ]);
 
-    // Pending payments from invoices
-    const pendingPaymentsRes = await db.query("SELECT COALESCE(SUM(amount), 0)::numeric as pending FROM invoices WHERE status = 'pending'");
-
-    // Plan distribution
-    const planDistRes = await db.query(`
-      SELECT COALESCE(INITCAP(s.plan), 'Starter') as label, COUNT(*)::int as value
-      FROM subscriptions s
-      GROUP BY COALESCE(INITCAP(s.plan), 'Starter')
-      ORDER BY value DESC
-    `);
-
-    // Recent 5 restaurants
-    const recentRestos = await db.query(`
-      SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email, p.phone,
-             TO_CHAR(p.created_at, 'YYYY-MM-DD') as created,
-             p.city, p.business_type as "businessType",
-             COALESCE(p.status, 'active') as status,
-             COALESCE(s.plan, 'Starter') as plan, COALESCE(s.status, 'active') as "subStatus"
-      FROM partners p
-      LEFT JOIN subscriptions s ON p.id = s.partner_id
-      ORDER BY p.created_at DESC LIMIT 5
-    `);
-
-    // Recent payments / orders
-    const recentPayments = await db.query(`
-      SELECT o.id, o.order_number as invoice, o.total_amount as amount, o.payment_mode as method,
-             'Completed' as status, TO_CHAR(o.created_at, 'YYYY-MM-DD') as date, p.restaurant_name as restaurant
-      FROM sales_orders o
-      LEFT JOIN partners p ON o.restaurant_id = p.id
-      ORDER BY o.created_at DESC LIMIT 5
-    `);
-
-    // Recent activity logs
-    const recentActivityLogs = await db.query(`
-      SELECT a.id, COALESCE(p.restaurant_name, 'System') as restaurant,
-             COALESCE(u.full_name, a.user_name, 'Admin') as user, a.action, a.description as detail,
-             a.ip_address as ip,
-             'Success' as status,
-             TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI') as timestamp,
-             a.created_at as date
-      FROM activity_logs a
-      LEFT JOIN partners p ON a.restaurant_id = p.id
-      LEFT JOIN restaurant_users u ON a.user_id = u.id
-      ORDER BY a.created_at DESC LIMIT 6
-    `);
-
-    // Dynamic monthly series for charts
-    const monthlySeriesRes = await db.query(`
-      WITH months AS (
-        SELECT generate_series(
-          DATE_TRUNC('month', NOW() - INTERVAL '5 months'),
-          DATE_TRUNC('month', NOW()),
-          '1 month'::interval
-        ) as m
-      )
-      SELECT TO_CHAR(months.m, 'Mon') as label,
-             COALESCE((SELECT COUNT(*)::int FROM partners WHERE DATE_TRUNC('month', created_at) = months.m), 0) as new_restaurants,
-             COALESCE((SELECT SUM(total_amount)::numeric FROM sales_orders WHERE DATE_TRUNC('month', created_at) = months.m), 0) as sales,
-             COALESCE((SELECT COUNT(*)::int FROM subscriptions WHERE created_at <= months.m + INTERVAL '1 month' AND status IN ('active', 'trial')), 0) as subs
-      FROM months
-      ORDER BY months.m ASC
-    `);
+    const kpi = kpiRes.rows[0] || {};
+    const totalRestaurants = Number(kpi.total_restaurants || 0);
+    const activeRestaurants = Number(kpi.active_restaurants || 0);
+    const trialRestaurants = Number(kpi.trial_restaurants || 0);
+    const expired = Number(kpi.expired || 0);
+    const suspended = Number(kpi.suspended || 0);
+    const mrr = Number(kpi.mrr || 0);
+    const monthlyRevenue = Number(kpi.monthly_revenue || 0);
+    const pendingPayments = Number(kpi.pending_payments || 0);
 
     const newRestaurantsSeries = monthlySeriesRes.rows.map(r => ({ label: r.label, value: Number(r.new_restaurants) }));
-    const revenueSeries = monthlySeriesRes.rows.map(r => ({
-      label: r.label,
-      value: Number(r.sales || 0)
-    }));
+    const revenueSeries = monthlySeriesRes.rows.map(r => ({ label: r.label, value: Number(r.sales || 0) }));
     const subGrowthSeries = monthlySeriesRes.rows.map(r => ({ label: r.label, value: Number(r.subs) }));
-
-    // Expiring subscriptions
-    const expiringRestos = await db.query(`
-      SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email,
-             COALESCE(s.plan, 'Starter') as plan,
-             TO_CHAR(s.expiry_date, 'YYYY-MM-DD') as "subExpiry",
-             COALESCE(s.status, 'active') as "subStatus"
-      FROM partners p
-      JOIN subscriptions s ON p.id = s.partner_id
-      WHERE s.expiry_date IS NOT NULL
-      ORDER BY s.expiry_date ASC LIMIT 5
-    `);
-
-    // Open support tickets
-    const openTicketsRes = await db.query(`
-      SELECT t.id, t.ticket_number as "ticketId", COALESCE(p.restaurant_name, 'Partner') as restaurant,
-             t.subject, t.priority, t.status,
-             TO_CHAR(t.created_at, 'YYYY-MM-DD') as created
-      FROM support_tickets t
-      LEFT JOIN partners p ON t.partner_id = p.id
-      ORDER BY t.created_at DESC LIMIT 5
-    `);
-
-    const mrr = Number(subRevRes.rows[0]?.mrr || 0);
-    const monthlyRevenue = Number(ordersRes.rows[0]?.total_sales || 0);
-    const pendingPayments = Number(pendingPaymentsRes.rows[0]?.pending || 0);
-    const totalRestaurants = parseInt(totalRestoRes.rows[0]?.count || '0', 10);
-    const activeRestaurants = parseInt(activeRestoRes.rows[0]?.count || '0', 10);
-    const trialRestaurants = parseInt(trialSubRes.rows[0]?.count || '0', 10);
-    const expired = parseInt(expiredSubRes.rows[0]?.count || '0', 10);
-    const suspended = parseInt(suspendedRes.rows[0]?.count || '0', 10);
 
     return res.json({
       success: true,
@@ -5004,8 +7160,40 @@ app.get('/api/admin/dashboard/stats', async (_req, res) => {
 // 2. Restaurants Management
 app.get('/api/admin/restaurants', async (req, res) => {
   try {
-    const { search = '', status = 'all' } = req.query as any;
-    let query = `
+    const { search = '', status = 'all', page, limit } = req.query as any;
+    
+    let whereClause = 'WHERE 1=1';
+    const params: any[] = [];
+    if (search) {
+      params.push(`%${search}%`);
+      whereClause += ` AND (p.restaurant_name ILIKE $${params.length} OR p.owner_name ILIKE $${params.length} OR p.email ILIKE $${params.length} OR p.phone ILIKE $${params.length})`;
+    }
+    if (status !== 'all') {
+      params.push(status);
+      whereClause += ` AND LOWER(p.status) = LOWER($${params.length})`;
+    }
+
+    let paginationClause = '';
+    if (limit && !isNaN(Number(limit))) {
+      const pageNum = Math.max(1, Number(page) || 1);
+      const limitNum = Math.min(1000, Math.max(1, Number(limit)));
+      const offsetNum = (pageNum - 1) * limitNum;
+      paginationClause = ` LIMIT ${limitNum} OFFSET ${offsetNum}`;
+    }
+
+    const query = `
+      WITH branch_agg AS (
+        SELECT restaurant_id, COUNT(*)::int as branches_count
+        FROM branches GROUP BY restaurant_id
+      ),
+      user_agg AS (
+        SELECT restaurant_id, COUNT(*)::int as users_count
+        FROM restaurant_users GROUP BY restaurant_id
+      ),
+      gmv_agg AS (
+        SELECT restaurant_id, COALESCE(SUM(total_amount), 0)::numeric as total_gmv
+        FROM sales_orders GROUP BY restaurant_id
+      )
       SELECT p.id, p.restaurant_name as name, p.owner_name as owner, p.email, p.phone,
              p.city, COALESCE(p.city, 'India') as address, p.gst_number, p.business_type as "businessType",
              COALESCE(p.status, 'active') as status,
@@ -5013,23 +7201,18 @@ app.get('/api/admin/restaurants', async (req, res) => {
              COALESCE(s.plan, 'Starter') as plan,
              COALESCE(s.status, 'active') as "subStatus",
              TO_CHAR(s.expiry_date, 'YYYY-MM-DD') as "subExpiry",
-             (SELECT COUNT(*) FROM branches b WHERE b.restaurant_id = p.id)::int as branches,
-             (SELECT COUNT(*) FROM restaurant_users u WHERE u.restaurant_id = p.id)::int as users,
-             COALESCE((SELECT SUM(total_amount) FROM sales_orders o WHERE o.restaurant_id = p.id), 0)::numeric as total_gmv
+             COALESCE(b.branches_count, 0) as branches,
+             COALESCE(u.users_count, 0) as users,
+             COALESCE(g.total_gmv, 0) as total_gmv
       FROM partners p
       LEFT JOIN subscriptions s ON p.id = s.partner_id
-      WHERE 1=1
+      LEFT JOIN branch_agg b ON b.restaurant_id = p.id
+      LEFT JOIN user_agg u ON u.restaurant_id = p.id
+      LEFT JOIN gmv_agg g ON g.restaurant_id = p.id
+      ${whereClause}
+      ORDER BY p.created_at DESC
+      ${paginationClause}
     `;
-    const params: any[] = [];
-    if (search) {
-      params.push(`%${search}%`);
-      query += ` AND (p.restaurant_name ILIKE $${params.length} OR p.owner_name ILIKE $${params.length} OR p.email ILIKE $${params.length} OR p.phone ILIKE $${params.length})`;
-    }
-    if (status !== 'all') {
-      params.push(status);
-      query += ` AND LOWER(p.status) = LOWER($${params.length})`;
-    }
-    query += ` ORDER BY p.created_at DESC`;
 
     const r = await db.query(query, params);
     return res.json({ success: true, data: r.rows });
@@ -5188,20 +7371,40 @@ app.patch('/api/admin/restaurants/:id/status', async (req, res) => {
 });
 
 // 4. Subscriptions List
-app.get('/api/admin/subscriptions', async (_req, res) => {
+app.get('/api/admin/subscriptions', async (req, res) => {
   try {
+    const { page, limit } = req.query as any;
+    let paginationClause = '';
+    if (limit && !isNaN(Number(limit))) {
+      const pageNum = Math.max(1, Number(page) || 1);
+      const limitNum = Math.min(1000, Math.max(1, Number(limit)));
+      const offsetNum = (pageNum - 1) * limitNum;
+      paginationClause = ` LIMIT ${limitNum} OFFSET ${offsetNum}`;
+    }
+
     const r = await db.query(`
+      WITH branch_agg AS (
+        SELECT restaurant_id, COUNT(*)::int as branches_count
+        FROM branches GROUP BY restaurant_id
+      ),
+      user_agg AS (
+        SELECT restaurant_id, COUNT(*)::int as users_count
+        FROM restaurant_users GROUP BY restaurant_id
+      )
       SELECT s.id, s.partner_id as "restaurantId", p.restaurant_name as "restaurantName",
              p.email, COALESCE(s.plan, 'Starter') as plan,
              COALESCE(s.status, 'active') as status,
              TO_CHAR(s.start_date, 'YYYY-MM-DD') as "startDate",
              TO_CHAR(s.expiry_date, 'YYYY-MM-DD') as "expiryDate",
              s.auto_renew as "autoRenew",
-             (SELECT COUNT(*) FROM branches b WHERE b.restaurant_id = p.id)::int as "branchesCount",
-             (SELECT COUNT(*) FROM restaurant_users u WHERE u.restaurant_id = p.id)::int as "usersCount"
+             COALESCE(b.branches_count, 0) as "branchesCount",
+             COALESCE(u.users_count, 0) as "usersCount"
       FROM subscriptions s
       JOIN partners p ON s.partner_id = p.id
+      LEFT JOIN branch_agg b ON b.restaurant_id = p.id
+      LEFT JOIN user_agg u ON u.restaurant_id = p.id
       ORDER BY s.created_at DESC
+      ${paginationClause}
     `);
     return res.json({ success: true, data: r.rows });
   } catch (err: any) {
@@ -5261,8 +7464,17 @@ app.get('/api/admin/invoices', async (_req, res) => {
 });
 
 // 8. Users List & Status
-app.get('/api/admin/users', async (_req, res) => {
+app.get('/api/admin/users', async (req, res) => {
   try {
+    const { page, limit } = req.query as any;
+    let paginationClause = '';
+    if (limit && !isNaN(Number(limit))) {
+      const pageNum = Math.max(1, Number(page) || 1);
+      const limitNum = Math.min(1000, Math.max(1, Number(limit)));
+      const offsetNum = (pageNum - 1) * limitNum;
+      paginationClause = ` LIMIT ${limitNum} OFFSET ${offsetNum}`;
+    }
+
     const r = await db.query(`
       SELECT u.id, u.full_name as name, u.email, u.phone, u.role,
              p.restaurant_name as "restaurantName",
@@ -5271,6 +7483,7 @@ app.get('/api/admin/users', async (_req, res) => {
       FROM restaurant_users u
       LEFT JOIN partners p ON u.restaurant_id = p.id
       ORDER BY u.created_at DESC
+      ${paginationClause}
     `);
     return res.json({ success: true, data: r.rows });
   } catch (err: any) {
@@ -5306,18 +7519,38 @@ app.patch('/api/admin/users/:id/status', async (req, res) => {
 });
 
 // 9. Branches
-app.get('/api/admin/branches', async (_req, res) => {
+app.get('/api/admin/branches', async (req, res) => {
   try {
+    const { page, limit } = req.query as any;
+    let paginationClause = '';
+    if (limit && !isNaN(Number(limit))) {
+      const pageNum = Math.max(1, Number(page) || 1);
+      const limitNum = Math.min(1000, Math.max(1, Number(limit)));
+      const offsetNum = (pageNum - 1) * limitNum;
+      paginationClause = ` LIMIT ${limitNum} OFFSET ${offsetNum}`;
+    }
+
     const r = await db.query(`
+      WITH branch_users AS (
+        SELECT branch_id, COUNT(*)::int as users_count
+        FROM restaurant_users WHERE branch_id IS NOT NULL GROUP BY branch_id
+      ),
+      branch_inv AS (
+        SELECT branch_id, COUNT(*)::int as items_count
+        FROM inventory_items WHERE branch_id IS NOT NULL GROUP BY branch_id
+      )
       SELECT b.id, b.name, b.code, b.city, b.state, b.phone, b.manager_name as manager,
              p.restaurant_name as "restaurantName",
-             (SELECT COUNT(*) FROM restaurant_users u WHERE u.branch_id = b.id)::int as users,
-             (SELECT COUNT(*) FROM inventory_items i WHERE i.branch_id = b.id)::int as "inventoryItems",
+             COALESCE(bu.users_count, 0) as users,
+             COALESCE(bi.items_count, 0) as "inventoryItems",
              TO_CHAR(b.created_at, 'YYYY-MM-DD') as created,
              COALESCE(b.status, 'Active') as status
       FROM branches b
       LEFT JOIN partners p ON b.restaurant_id = p.id
+      LEFT JOIN branch_users bu ON bu.branch_id = b.id
+      LEFT JOIN branch_inv bi ON bi.branch_id = b.id
       ORDER BY b.created_at DESC
+      ${paginationClause}
     `);
     return res.json({ success: true, data: r.rows });
   } catch (err: any) {

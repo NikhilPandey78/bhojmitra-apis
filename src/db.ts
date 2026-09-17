@@ -326,9 +326,9 @@ export async function initDatabase() {
     CREATE TABLE IF NOT EXISTS stock_transfers (
       id TEXT PRIMARY KEY,
       restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-      from_branch_id TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
-      to_branch_id TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
-      transfer_number TEXT NOT NULL,
+      from_branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+      to_branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+      transfer_number TEXT,
       transfer_date DATE NOT NULL DEFAULT CURRENT_DATE,
       status TEXT NOT NULL DEFAULT 'pending',
       notes TEXT,
@@ -1108,6 +1108,554 @@ export async function initDatabase() {
     ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
     ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS outstanding_balance NUMERIC DEFAULT 0;
     ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS invoice_date DATE;
+
+    -- ============================================================
+    -- MULTI-LOCATION INVENTORY & CENTRAL WAREHOUSE TABLES
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS inventory_locations (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+      name TEXT NOT NULL,
+      code TEXT,
+      type TEXT NOT NULL DEFAULT 'outlet', -- warehouse, kitchen, outlet, department
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      is_default BOOLEAN DEFAULT FALSE,
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_inv_locations_restaurant ON inventory_locations(restaurant_id);
+
+    CREATE TABLE IF NOT EXISTS location_inventory (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      location_id TEXT NOT NULL REFERENCES inventory_locations(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+      quantity NUMERIC NOT NULL DEFAULT 0,
+      min_stock NUMERIC DEFAULT 0,
+      reorder_level NUMERIC DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (location_id, item_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_loc_inv_restaurant ON location_inventory(restaurant_id);
+    CREATE INDEX IF NOT EXISTS idx_loc_inv_location ON location_inventory(location_id);
+    CREATE INDEX IF NOT EXISTS idx_loc_inv_item ON location_inventory(item_id);
+
+    -- ============================================================
+    -- POS OUTLETS & STATIONS
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS pos_outlets (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+      location_id TEXT REFERENCES inventory_locations(id) ON DELETE SET NULL,
+      kitchen_location_id TEXT REFERENCES inventory_locations(id) ON DELETE SET NULL,
+      name TEXT NOT NULL,
+      code TEXT NOT NULL, -- restaurant, bar, cafe, sky_lounge, pool, banquet, room_service
+      outlet_type TEXT NOT NULL DEFAULT 'dine_in',
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      receipt_header TEXT,
+      receipt_footer TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_pos_outlets_restaurant ON pos_outlets(restaurant_id);
+
+    -- ============================================================
+    -- HOTEL FOLIO TRANSACTIONS (CHARGE TO ROOM)
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS hotel_folio_transactions (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      booking_id TEXT NOT NULL REFERENCES hotel_bookings(id) ON DELETE CASCADE,
+      room_id TEXT REFERENCES hotel_rooms(id) ON DELETE SET NULL,
+      outlet_id TEXT REFERENCES pos_outlets(id) ON DELETE SET NULL,
+      outlet_name TEXT,
+      order_id TEXT REFERENCES sales_orders(id) ON DELETE SET NULL,
+      order_number TEXT,
+      charge_type TEXT NOT NULL DEFAULT 'restaurant',
+      description TEXT NOT NULL,
+      amount NUMERIC NOT NULL DEFAULT 0,
+      payment_status TEXT NOT NULL DEFAULT 'unpaid',
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_hotel_folio_restaurant ON hotel_folio_transactions(restaurant_id);
+    CREATE INDEX IF NOT EXISTS idx_hotel_folio_booking ON hotel_folio_transactions(booking_id);
+
+    -- ============================================================
+    -- POOL TICKETING MODULE
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS pool_ticket_types (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      price NUMERIC NOT NULL DEFAULT 0,
+      description TEXT,
+      duration_hours NUMERIC DEFAULT 4,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_pool_ticket_types_restaurant ON pool_ticket_types(restaurant_id);
+
+    CREATE TABLE IF NOT EXISTS pool_tickets (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+      ticket_type_id TEXT REFERENCES pool_ticket_types(id) ON DELETE SET NULL,
+      ticket_number TEXT NOT NULL,
+      ticket_name TEXT NOT NULL,
+      customer_name TEXT NOT NULL,
+      customer_phone TEXT,
+      room_number TEXT,
+      guest_booking_id TEXT REFERENCES hotel_bookings(id) ON DELETE SET NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      unit_price NUMERIC NOT NULL DEFAULT 0,
+      total_amount NUMERIC NOT NULL DEFAULT 0,
+      payment_mode TEXT NOT NULL DEFAULT 'cash',
+      payment_status TEXT NOT NULL DEFAULT 'paid',
+      status TEXT NOT NULL DEFAULT 'active',
+      valid_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      sold_by TEXT,
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_pool_tickets_restaurant ON pool_tickets(restaurant_id);
+
+    -- ============================================================
+    -- HOUSEKEEPING TASKS & LINEN
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS housekeeping_tasks (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      room_id TEXT REFERENCES hotel_rooms(id) ON DELETE CASCADE,
+      room_number TEXT NOT NULL,
+      task_type TEXT NOT NULL DEFAULT 'daily_cleaning',
+      assigned_to TEXT,
+      assigned_to_name TEXT,
+      priority TEXT NOT NULL DEFAULT 'normal',
+      status TEXT NOT NULL DEFAULT 'pending',
+      checklist JSONB DEFAULT '[]',
+      linen_issued JSONB DEFAULT '[]',
+      amenities_issued JSONB DEFAULT '[]',
+      notes TEXT,
+      completed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_hk_tasks_restaurant ON housekeeping_tasks(restaurant_id);
+
+    -- ============================================================
+    -- ENGINEERING / MAINTENANCE WORK ORDERS
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS engineering_tickets (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      ticket_number TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      asset_name TEXT,
+      room_id TEXT REFERENCES hotel_rooms(id) ON DELETE SET NULL,
+      room_number TEXT,
+      location_id TEXT REFERENCES inventory_locations(id) ON DELETE SET NULL,
+      location_name TEXT,
+      priority TEXT NOT NULL DEFAULT 'medium',
+      assigned_to TEXT,
+      assigned_to_name TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      parts_consumed JSONB DEFAULT '[]',
+      total_cost NUMERIC NOT NULL DEFAULT 0,
+      resolved_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_eng_tickets_restaurant ON engineering_tickets(restaurant_id);
+
+    -- ============================================================
+    -- HOTEL NIGHT AUDIT
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS hotel_night_audits (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+      audit_number TEXT NOT NULL,
+      audit_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      room_revenue NUMERIC NOT NULL DEFAULT 0,
+      pos_revenue NUMERIC NOT NULL DEFAULT 0,
+      banquet_revenue NUMERIC NOT NULL DEFAULT 0,
+      pool_revenue NUMERIC NOT NULL DEFAULT 0,
+      other_revenue NUMERIC NOT NULL DEFAULT 0,
+      total_revenue NUMERIC NOT NULL DEFAULT 0,
+      total_rooms INTEGER NOT NULL DEFAULT 0,
+      occupied_rooms INTEGER NOT NULL DEFAULT 0,
+      occupancy_rate NUMERIC NOT NULL DEFAULT 0,
+      room_charges_posted NUMERIC NOT NULL DEFAULT 0,
+      payments_collected NUMERIC NOT NULL DEFAULT 0,
+      audited_by TEXT,
+      status TEXT NOT NULL DEFAULT 'completed',
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_night_audits_restaurant ON hotel_night_audits(restaurant_id);
+
+    -- ============================================================
+    -- EXTENDED ATTRIBUTES & SETTINGS FOR INTERNATIONALIZATION
+    -- ============================================================
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'INR';
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS currency_symbol TEXT DEFAULT '₹';
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS tax_name TEXT DEFAULT 'GST';
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS default_tax_rate NUMERIC DEFAULT 5;
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS locale TEXT DEFAULT 'en-US';
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS auto_deduct_recipe_stock BOOLEAN DEFAULT TRUE;
+
+    ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS outlet_id TEXT;
+    ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS outlet_name TEXT;
+    ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS location_id TEXT;
+    ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS is_room_charge BOOLEAN DEFAULT FALSE;
+    ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS room_id TEXT;
+    ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS guest_booking_id TEXT;
+    ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS folio_transaction_id TEXT;
+
+    ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS from_location_id TEXT;
+    ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS to_location_id TEXT;
+    ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS approved_by TEXT;
+    ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+    ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS completed_by TEXT;
+    ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+    ALTER TABLE stock_transfers ALTER COLUMN from_branch_id DROP NOT NULL;
+    ALTER TABLE stock_transfers ALTER COLUMN to_branch_id DROP NOT NULL;
+    ALTER TABLE stock_transfers ALTER COLUMN transfer_number DROP NOT NULL;
+
+    ALTER TABLE stock_transactions ADD COLUMN IF NOT EXISTS location_id TEXT;
+    ALTER TABLE stock_receipts ADD COLUMN IF NOT EXISTS location_id TEXT;
+    ALTER TABLE stock_issues ADD COLUMN IF NOT EXISTS location_id TEXT;
+    ALTER TABLE stock_adjustments ADD COLUMN IF NOT EXISTS location_id TEXT;
+    ALTER TABLE stock_counts ADD COLUMN IF NOT EXISTS location_id TEXT;
+
+    ALTER TABLE day_closings ADD COLUMN IF NOT EXISTS outlet_id TEXT;
+    ALTER TABLE day_closings ADD COLUMN IF NOT EXISTS outlet_name TEXT;
+    ALTER TABLE day_closings ADD COLUMN IF NOT EXISTS location_id TEXT;
+    ALTER TABLE day_closings ADD COLUMN IF NOT EXISTS shift_number TEXT;
+
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS folio_charges JSONB DEFAULT '[]';
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS bar_charge NUMERIC DEFAULT 0;
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS pool_charge NUMERIC DEFAULT 0;
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS banquet_charge NUMERIC DEFAULT 0;
+
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS cleaning_status TEXT DEFAULT 'clean';
+
+    -- ============================================================
+    -- PERFORMANCE OPTIMIZATION INDEXES (PHASE 4 AUDIT)
+    -- ============================================================
+    -- 1. Partners & Tenants
+    CREATE INDEX IF NOT EXISTS idx_partners_status ON partners(status);
+    CREATE INDEX IF NOT EXISTS idx_partners_business_type ON partners(business_type);
+    CREATE INDEX IF NOT EXISTS idx_partners_created ON partners(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_partners_email ON partners(email);
+
+    -- 2. Subscriptions
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_partner ON subscriptions(partner_id);
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_plan ON subscriptions(plan);
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_expiry ON subscriptions(expiry_date);
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_created ON subscriptions(created_at DESC);
+
+    -- 3. Invoices & Payments
+    CREATE INDEX IF NOT EXISTS idx_invoices_partner ON invoices(partner_id);
+    CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
+    CREATE INDEX IF NOT EXISTS idx_invoices_created ON invoices(created_at DESC);
+
+    -- 4. Support Tickets
+    CREATE INDEX IF NOT EXISTS idx_support_tickets_partner ON support_tickets(partner_id);
+    CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status);
+    CREATE INDEX IF NOT EXISTS idx_support_tickets_created ON support_tickets(created_at DESC);
+
+    -- 5. Branches & Users
+    CREATE INDEX IF NOT EXISTS idx_branches_rest_status ON branches(restaurant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_resto_users_branch ON restaurant_users(branch_id);
+    CREATE INDEX IF NOT EXISTS idx_resto_users_rest_status ON restaurant_users(restaurant_id, status);
+
+    -- 6. Recipes & Recipe Ingredients
+    CREATE INDEX IF NOT EXISTS idx_recipes_rest_status ON recipes(restaurant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_recipe_ing_recipe ON recipe_ingredients(recipe_id);
+    CREATE INDEX IF NOT EXISTS idx_recipe_ing_rest ON recipe_ingredients(restaurant_id);
+    CREATE INDEX IF NOT EXISTS idx_recipe_ing_item ON recipe_ingredients(item_id);
+
+    -- 7. Menu Items
+    CREATE INDEX IF NOT EXISTS idx_menu_items_recipe ON menu_items(recipe_id);
+    CREATE INDEX IF NOT EXISTS idx_menu_items_rest_avail ON menu_items(restaurant_id, is_available);
+
+    -- 8. Inventory, Location Inventory & Transactions
+    CREATE INDEX IF NOT EXISTS idx_inv_items_rest_status ON inventory_items(restaurant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_inv_items_category ON inventory_items(category_id);
+    CREATE INDEX IF NOT EXISTS idx_inv_items_supplier ON inventory_items(supplier_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_tx_rest_date ON stock_transactions(restaurant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_stock_tx_item ON stock_transactions(item_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_tx_type ON stock_transactions(transaction_type);
+    CREATE INDEX IF NOT EXISTS idx_stock_tx_location ON stock_transactions(location_id);
+
+    -- 9. Sales Orders & Items
+    CREATE INDEX IF NOT EXISTS idx_sales_orders_rest_outlet ON sales_orders(restaurant_id, outlet_id);
+    CREATE INDEX IF NOT EXISTS idx_sales_orders_rest_created ON sales_orders(restaurant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_sales_orders_status ON sales_orders(status);
+    CREATE INDEX IF NOT EXISTS idx_sales_orders_booking ON sales_orders(guest_booking_id);
+    CREATE INDEX IF NOT EXISTS idx_sales_items_menu_item ON sales_order_items(menu_item_id);
+
+    -- 10. Transfers, Issues, Receipts, Counts, Adjustments
+    CREATE INDEX IF NOT EXISTS idx_stock_transfers_rest ON stock_transfers(restaurant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_stock_transfers_from_loc ON stock_transfers(from_location_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_transfers_to_loc ON stock_transfers(to_location_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_transfer_items_transfer ON stock_transfer_items(stock_transfer_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_transfer_items_rest ON stock_transfer_items(restaurant_id);
+
+    CREATE INDEX IF NOT EXISTS idx_stock_adjustments_rest ON stock_adjustments(restaurant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_stock_adj_items_adj ON stock_adjustment_items(stock_adjustment_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_adj_items_rest ON stock_adjustment_items(restaurant_id);
+
+    CREATE INDEX IF NOT EXISTS idx_stock_counts_rest ON stock_counts(restaurant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_stock_count_items_count ON stock_count_items(stock_count_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_count_items_rest ON stock_count_items(restaurant_id);
+
+    CREATE INDEX IF NOT EXISTS idx_stock_receipts_rest ON stock_receipts(restaurant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_stock_receipt_items_rcpt ON stock_receipt_items(stock_receipt_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_receipt_items_rest ON stock_receipt_items(restaurant_id);
+
+    CREATE INDEX IF NOT EXISTS idx_purchase_returns_rest ON purchase_returns(restaurant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_purchase_return_items_ret ON purchase_return_items(purchase_return_id);
+    CREATE INDEX IF NOT EXISTS idx_purchase_return_items_rest ON purchase_return_items(restaurant_id);
+
+    CREATE INDEX IF NOT EXISTS idx_kitchen_reqs_rest ON kitchen_requisitions(restaurant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_kitchen_req_items_req ON kitchen_requisition_items(kitchen_requisition_id);
+    CREATE INDEX IF NOT EXISTS idx_kitchen_req_items_rest ON kitchen_requisition_items(restaurant_id);
+
+    -- 11. Hotel Operations
+    CREATE INDEX IF NOT EXISTS idx_hotel_rooms_rest_status ON hotel_rooms(restaurant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_hotel_bookings_rest_status ON hotel_bookings(restaurant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_hotel_bookings_room ON hotel_bookings(room_id);
+    CREATE INDEX IF NOT EXISTS idx_hotel_bookings_dates ON hotel_bookings(check_in_date, check_out_date);
+    CREATE INDEX IF NOT EXISTS idx_hotel_banquets_rest_date ON hotel_banquets(restaurant_id, event_date);
+    CREATE INDEX IF NOT EXISTS idx_hk_tasks_rest_status ON housekeeping_tasks(restaurant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_hk_tasks_room ON housekeeping_tasks(room_id);
+    CREATE INDEX IF NOT EXISTS idx_eng_tickets_rest_status ON engineering_tickets(restaurant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_day_closings_rest_outlet ON day_closings(restaurant_id, outlet_id);
+    CREATE INDEX IF NOT EXISTS idx_day_closings_date ON day_closings(closing_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_night_audits_rest_date ON hotel_night_audits(restaurant_id, audit_date DESC);
+
+    -- ============================================================
+    -- PHASE 2-24 ENTERPRISE HOTEL PMS, FOLIO, KDS & LIQUOR SCHEMAS
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS hotel_guests (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      full_name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      email TEXT,
+      nationality TEXT DEFAULT 'Indian',
+      id_proof_type TEXT DEFAULT 'Aadhaar Card',
+      id_proof_number TEXT,
+      address TEXT,
+      city TEXT,
+      country TEXT DEFAULT 'India',
+      company_name TEXT,
+      gst_number TEXT,
+      vip_tier TEXT DEFAULT 'standard',
+      preferences TEXT,
+      total_stays INTEGER DEFAULT 0,
+      total_spend NUMERIC DEFAULT 0,
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_hotel_guests_rest_phone ON hotel_guests(restaurant_id, phone);
+
+    CREATE TABLE IF NOT EXISTS hotel_rate_plans (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      code TEXT NOT NULL,
+      room_type TEXT,
+      meal_plan TEXT DEFAULT 'European Plan (Room Only)',
+      base_rate NUMERIC NOT NULL DEFAULT 0,
+      extra_adult_rate NUMERIC DEFAULT 0,
+      extra_child_rate NUMERIC DEFAULT 0,
+      cancellation_policy TEXT,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_rate_plans_rest ON hotel_rate_plans(restaurant_id);
+
+    CREATE TABLE IF NOT EXISTS hotel_folios (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      booking_id TEXT NOT NULL REFERENCES hotel_bookings(id) ON DELETE CASCADE,
+      folio_number TEXT NOT NULL,
+      guest_id TEXT REFERENCES hotel_guests(id) ON DELETE SET NULL,
+      room_id TEXT REFERENCES hotel_rooms(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      total_charges NUMERIC NOT NULL DEFAULT 0,
+      total_tax NUMERIC NOT NULL DEFAULT 0,
+      total_discount NUMERIC NOT NULL DEFAULT 0,
+      total_payments NUMERIC NOT NULL DEFAULT 0,
+      balance_due NUMERIC NOT NULL DEFAULT 0,
+      credit_limit NUMERIC DEFAULT 50000,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_folios_rest_booking ON hotel_folios(restaurant_id, booking_id);
+
+    CREATE TABLE IF NOT EXISTS hotel_folio_items (
+      id TEXT PRIMARY KEY,
+      folio_id TEXT NOT NULL REFERENCES hotel_folios(id) ON DELETE CASCADE,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      booking_id TEXT NOT NULL REFERENCES hotel_bookings(id) ON DELETE CASCADE,
+      window_number INTEGER NOT NULL DEFAULT 1,
+      charge_category TEXT NOT NULL,
+      source_module TEXT NOT NULL DEFAULT 'front_desk',
+      outlet_id TEXT,
+      outlet_name TEXT,
+      reference_type TEXT,
+      reference_id TEXT,
+      description TEXT NOT NULL,
+      amount NUMERIC NOT NULL DEFAULT 0,
+      tax_amount NUMERIC NOT NULL DEFAULT 0,
+      discount_amount NUMERIC NOT NULL DEFAULT 0,
+      total_amount NUMERIC NOT NULL DEFAULT 0,
+      payment_status TEXT NOT NULL DEFAULT 'unpaid',
+      posted_by TEXT,
+      posted_by_name TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_folio_items_folio ON hotel_folio_items(folio_id);
+    CREATE INDEX IF NOT EXISTS idx_folio_items_rest ON hotel_folio_items(restaurant_id);
+    CREATE INDEX IF NOT EXISTS idx_folio_items_booking ON hotel_folio_items(booking_id);
+
+    CREATE TABLE IF NOT EXISTS hotel_room_moves (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      booking_id TEXT NOT NULL REFERENCES hotel_bookings(id) ON DELETE CASCADE,
+      from_room_id TEXT NOT NULL REFERENCES hotel_rooms(id) ON DELETE CASCADE,
+      to_room_id TEXT NOT NULL REFERENCES hotel_rooms(id) ON DELETE CASCADE,
+      from_room_number TEXT NOT NULL,
+      to_room_number TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      rate_difference NUMERIC DEFAULT 0,
+      moved_by TEXT,
+      moved_by_name TEXT,
+      moved_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_room_moves_booking ON hotel_room_moves(booking_id);
+
+    CREATE TABLE IF NOT EXISTS kds_stations (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+      name TEXT NOT NULL,
+      code TEXT NOT NULL,
+      outlet_id TEXT REFERENCES pos_outlets(id) ON DELETE SET NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      printer_ip TEXT,
+      auto_bump_seconds INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_kds_stations_rest ON kds_stations(restaurant_id);
+
+    CREATE TABLE IF NOT EXISTS kds_priority_logs (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      ticket_id TEXT NOT NULL REFERENCES kot_tickets(id) ON DELETE CASCADE,
+      kot_number TEXT NOT NULL,
+      old_priority TEXT NOT NULL,
+      new_priority TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      changed_by TEXT,
+      changed_by_name TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_kds_prio_rest ON kds_priority_logs(restaurant_id);
+
+    CREATE TABLE IF NOT EXISTS bar_bottle_sessions (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+      brand_name TEXT NOT NULL,
+      bottle_size_ml NUMERIC NOT NULL DEFAULT 750,
+      peg_size_ml NUMERIC NOT NULL DEFAULT 30,
+      opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      total_pegs_sold NUMERIC NOT NULL DEFAULT 0,
+      ml_consumed NUMERIC NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'open'
+    );
+    CREATE INDEX IF NOT EXISTS idx_bar_sessions_rest ON bar_bottle_sessions(restaurant_id);
+
+    CREATE TABLE IF NOT EXISTS bar_daily_closings (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+      closing_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      outlet_id TEXT REFERENCES pos_outlets(id) ON DELETE SET NULL,
+      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+      item_name TEXT NOT NULL,
+      opening_ml NUMERIC NOT NULL DEFAULT 0,
+      received_ml NUMERIC NOT NULL DEFAULT 0,
+      sold_ml NUMERIC NOT NULL DEFAULT 0,
+      wastage_ml NUMERIC NOT NULL DEFAULT 0,
+      theoretical_closing_ml NUMERIC NOT NULL DEFAULT 0,
+      physical_closing_ml NUMERIC NOT NULL DEFAULT 0,
+      variance_ml NUMERIC NOT NULL DEFAULT 0,
+      cost_variance NUMERIC NOT NULL DEFAULT 0,
+      closed_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_bar_closings_rest ON bar_daily_closings(restaurant_id, closing_date);
+
+    CREATE TABLE IF NOT EXISTS hotel_business_dates (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL UNIQUE REFERENCES partners(id) ON DELETE CASCADE,
+      current_business_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      last_audit_date DATE,
+      is_audit_in_progress BOOLEAN NOT NULL DEFAULT FALSE,
+      locked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_biz_dates_rest ON hotel_business_dates(restaurant_id);
+    ALTER TABLE hotel_business_dates ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    -- Extended Hotel Columns Migrations
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS building TEXT DEFAULT 'Main Building';
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS wing TEXT DEFAULT 'East Wing';
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS room_status TEXT DEFAULT 'VACANT_CLEAN';
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS is_out_of_order BOOLEAN DEFAULT FALSE;
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS maintenance_reason TEXT;
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS rate_plan_id TEXT;
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS inspected_by TEXT;
+    ALTER TABLE hotel_rooms ADD COLUMN IF NOT EXISTS inspected_at TIMESTAMPTZ;
+
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS reservation_status TEXT DEFAULT 'CONFIRMED';
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS guest_id TEXT;
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS rate_plan_id TEXT;
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'direct';
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS billing_instructions TEXT;
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS key_card_status TEXT DEFAULT 'ready';
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS deposit_amount NUMERIC DEFAULT 0;
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS early_check_in_fee NUMERIC DEFAULT 0;
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS late_checkout_fee NUMERIC DEFAULT 0;
+    ALTER TABLE hotel_bookings ADD COLUMN IF NOT EXISTS master_folio_id TEXT;
+
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS station_id TEXT;
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS station_code TEXT DEFAULT 'kitchen';
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'NORMAL';
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS sla_minutes INTEGER DEFAULT 20;
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS fired_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS ready_at TIMESTAMPTZ;
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS served_at TIMESTAMPTZ;
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS recalled_at TIMESTAMPTZ;
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS recalled_reason TEXT;
+    ALTER TABLE kot_tickets ADD COLUMN IF NOT EXISTS reprint_count INTEGER DEFAULT 0;
+
+    ALTER TABLE kot_items ADD COLUMN IF NOT EXISTS station_code TEXT DEFAULT 'kitchen';
+    ALTER TABLE kot_items ADD COLUMN IF NOT EXISTS course TEXT DEFAULT 'main';
+    ALTER TABLE kot_items ADD COLUMN IF NOT EXISTS chef_notes TEXT;
+    ALTER TABLE kot_items ADD COLUMN IF NOT EXISTS bumped_at TIMESTAMPTZ;
+    ALTER TABLE kot_items ADD COLUMN IF NOT EXISTS cancelled_reason TEXT;
   `);
 }
 
